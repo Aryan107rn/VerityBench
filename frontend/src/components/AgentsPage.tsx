@@ -1,3 +1,4 @@
+import { useState, type FormEvent } from 'react'
 import { Icon } from './Icon'
 import type { ApiAgent } from '../lib/api'
 
@@ -27,11 +28,31 @@ type AgentsPageProps = {
   loading: boolean
   onBrowseRuns: () => void
   onOpenCli: () => void
+  onRegister: (name: string, version: string, source: string) => Promise<void>
+  registrationBusy: boolean
   onRetry: () => void
 }
 
-export function AgentsPage({ agents, apiData, error, loading, onBrowseRuns, onOpenCli, onRetry }: AgentsPageProps) {
+export function AgentsPage({ agents, apiData, error, loading, onBrowseRuns, onOpenCli, onRegister, registrationBusy, onRetry }: AgentsPageProps) {
+  const [formOpen, setFormOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [version, setVersion] = useState('1.0.0')
+  const [source, setSource] = useState('')
+  const [formError, setFormError] = useState('')
   const visibleAgents = apiData ? agents : offlineAgents
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setFormError('')
+    try {
+      await onRegister(name, version, source)
+      setName('')
+      setVersion('1.0.0')
+      setSource('')
+      setFormOpen(false)
+    } catch (registrationError: unknown) {
+      setFormError(registrationError instanceof Error ? registrationError.message : 'Could not register the agent.')
+    }
+  }
   return (
     <>
       <div className="page-intro">
@@ -40,7 +61,7 @@ export function AgentsPage({ agents, apiData, error, loading, onBrowseRuns, onOp
           <h1>Agents</h1>
           <p>See which repository agents the selected project can execute from the web workspace.</p>
         </div>
-        <button className="button button-primary" onClick={onBrowseRuns} type="button"><Icon name="play" size={14} /> Browse runs</button>
+        <div className="page-intro-actions"><button className="button button-secondary" disabled={!apiData} onClick={() => setFormOpen((current) => !current)} type="button"><Icon name="file-plus" size={14} /> {formOpen ? 'Close registration' : 'Register remote agent'}</button><button className="button button-primary" onClick={onBrowseRuns} type="button"><Icon name="play" size={14} /> Browse runs</button></div>
       </div>
 
       <div className={`data-notice ${apiData ? 'data-notice-live' : ''}`}>
@@ -52,6 +73,7 @@ export function AgentsPage({ agents, apiData, error, loading, onBrowseRuns, onOp
       </div>
 
       {error && <div className="inline-error" role="alert">{error}<button className="text-button" onClick={onRetry} type="button">Try again</button></div>}
+      {formOpen && apiData && <form className="panel agent-registration-form" onSubmit={(event) => void submit(event)}><div><span className="section-kicker">Explicit remote integration</span><h2>Register a compatible Python agent</h2><p>Source is stored as an artifact and never imported by FastAPI. A separately configured Docker worker must be running before its remote runs can complete.</p></div><label>Name<input maxLength={128} onChange={(event) => setName(event.target.value)} required value={name} /></label><label>Version<input maxLength={64} onChange={(event) => setVersion(event.target.value)} required value={version} /></label><label className="agent-source-field">Contract source<textarea maxLength={256000} onChange={(event) => setSource(event.target.value)} placeholder="Paste a version-1 module exporting create_agent()." required rows={10} value={source} /></label>{formError && <p className="auth-error" role="alert">{formError}</p>}<div className="form-actions"><button className="button button-primary" disabled={registrationBusy} type="submit">{registrationBusy ? 'Registering…' : 'Store agent artifact'}</button><button className="button button-quiet" onClick={() => setFormOpen(false)} type="button">Cancel</button></div></form>}
       {loading ? <div className="detail-loading" role="status">Loading agents from the selected project…</div> : (
         <section aria-label="Available agents" className="agent-grid">
           {visibleAgents.map((agent) => <AgentCard agent={agent} apiData={apiData} key={agent.key} />)}
@@ -75,14 +97,15 @@ export function AgentsPage({ agents, apiData, error, loading, onBrowseRuns, onOp
 function AgentCard({ agent, apiData }: { agent: ApiAgent; apiData: boolean }) {
   return (
     <article className="panel agent-card">
-      <div className="agent-card-top">
-        <span className="agent-icon"><Icon name="sparkles" size={18} /></span>
-        <span className="agent-source-pill">{apiData ? 'API · repository' : 'Offline fixture'}</span>
+       <div className="agent-card-top">
+         <span className="agent-icon"><Icon name="sparkles" size={18} /></span>
+         <span className="agent-source-pill">{apiData ? `API · ${agent.source}` : 'Offline fixture'}</span>
       </div>
-      <h2>{agent.name}</h2>
+       <h2>{agent.name}</h2>
+       {agent.version && <span className="agent-version">v{agent.version}</span>}
       <p>{agent.description}</p>
-      <div className="agent-facts">
-        <span><strong>{agent.runnable ? 'Runnable' : 'Metadata only'}</strong><small>web capability</small></span>
+       <div className="agent-facts">
+         <span><strong>{agent.runnable ? 'Runnable' : 'Disabled'}</strong><small>{agent.source === 'remote' ? 'isolated worker' : 'web capability'}</small></span>
         <span><strong>{agent.supported_scenarios.length}</strong><small>scenarios</small></span>
       </div>
       <div className="agent-scenarios">

@@ -8,6 +8,16 @@
       name="description"
       content="VerityBench — test agents and trust the evidence."
     />
+    <script>
+      (() => {
+        try {
+          const stored = localStorage.getItem('veritybench.theme')
+          document.documentElement.dataset.theme = stored === '"light"' ? 'light' : 'dark'
+        } catch {
+          document.documentElement.dataset.theme = 'dark'
+        }
+      })()
+    </script>
     <title>VerityBench · Agent reliability workspace</title>
   </head>
   <body>

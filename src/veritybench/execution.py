@@ -20,7 +20,9 @@ from veritybench_engine import (
     ExecutionCancelled,
     ExecutionEvent,
     FaultScenario,
+    OrderStatus,
     SimulationConfig,
+    SimulationResult,
 )
 
 from .db import SessionLocal
@@ -33,6 +35,18 @@ run_event_lock = Lock()
 LifecycleEventPayload = Mapping[str, object]
 AgentFactory = Callable[[], Agent]
 EngineFactory = Callable[[SimulationConfig], DeterministicEngine]
+TERMINAL_RUN_STATES = {
+    RunState.PASSED,
+    RunState.FAILED,
+    RunState.CANCELLED,
+    RunState.TIMED_OUT,
+    RunState.INCONCLUSIVE,
+}
+TERMINAL_ORDER_STATES = {
+    OrderStatus.FULFILLED,
+    OrderStatus.CANCELLED,
+    OrderStatus.PAYMENT_FAILED,
+}
 
 
 def append_run_event(
@@ -162,8 +176,11 @@ def _execute_run(
             if run.cancel_requested:
                 _cancel_run_locked(db, run, "cancellation requested")
                 return
-            run.report_json = json.dumps(result.to_dict(), sort_keys=True)
-            run.state = RunState.PASSED if result.evaluation.passed else RunState.FAILED
+            final_state = _state_for_result(result)
+            report = result.to_dict()
+            report["run_state"] = final_state.value
+            run.report_json = json.dumps(report, sort_keys=True)
+            run.state = final_state
             run.completed_at = datetime.now(UTC)
             append_run_event(
                 db,
@@ -181,28 +198,21 @@ def _execute_run(
         run = db.get(Run, run_id)
         if run is not None:
             _cancel_run(db, run, "cancellation requested")
+    except TimeoutError as exc:
+        _mark_execution_failure(
+            db,
+            run_id,
+            RunState.TIMED_OUT,
+            f"execution timed out: {type(exc).__name__}",
+        )
     except Exception as exc:  # bounded engine errors become explicit inconclusive runs
         logger.exception("background run execution failed", extra={"run_id": run_id})
-        db.rollback()
-        run = db.get(Run, run_id)
-        if run is not None:
-            with run_event_lock:
-                db.expire(run)
-                run = db.get(Run, run_id)
-                if run is not None:
-                    if run.cancel_requested:
-                        _cancel_run_locked(db, run, "cancellation requested")
-                    else:
-                        run.state = RunState.INCONCLUSIVE
-                        run.error_message = f"execution failed: {type(exc).__name__}"
-                        run.completed_at = datetime.now(UTC)
-                        append_run_event(
-                            db,
-                            run.id,
-                            "run_failed",
-                            {"state": RunState.INCONCLUSIVE.value, "error": run.error_message},
-                        )
-                        db.commit()
+        _mark_execution_failure(
+            db,
+            run_id,
+            RunState.INCONCLUSIVE,
+            f"execution failed: {type(exc).__name__}",
+        )
     finally:
         db.close()
 
@@ -213,6 +223,11 @@ def _cancel_run(db: Session, run: Run, reason: str) -> None:
 
 
 def _cancel_run_locked(db: Session, run: Run, reason: str) -> None:
+    db.expire(run)
+    current_run = db.get(Run, run.id)
+    if current_run is None or current_run.state in TERMINAL_RUN_STATES:
+        return
+    run = current_run
     run.cancel_requested = True
     run.state = RunState.CANCELLED
     run.completed_at = run.completed_at or datetime.now(UTC)
@@ -223,3 +238,51 @@ def _cancel_run_locked(db: Session, run: Run, reason: str) -> None:
         {"state": RunState.CANCELLED.value, "reason": reason},
     )
     db.commit()
+
+
+def _state_for_result(result: SimulationResult) -> RunState:
+    """Map an engine snapshot to an explicit persisted lifecycle state."""
+
+    # The execution module deliberately relies on the public result shape so a
+    # bounded engine cannot leave a successful-looking database row when it
+    # exhausts max_steps before reaching an order terminal state.
+    if result.order.status not in TERMINAL_ORDER_STATES:
+        return RunState.TIMED_OUT
+    return RunState.PASSED if result.evaluation.passed else RunState.FAILED
+
+
+def _mark_execution_failure(
+    db: Session,
+    run_id: str,
+    state: RunState,
+    error_message: str,
+) -> None:
+    """Persist an explicit failure state after an engine/worker exception."""
+
+    try:
+        db.rollback()
+        with run_event_lock:
+            run = db.get(Run, run_id)
+            if run is None:
+                return
+            db.expire(run)
+            run = db.get(Run, run_id)
+            if run is None or run.state in TERMINAL_RUN_STATES:
+                return
+            if run.cancel_requested:
+                _cancel_run_locked(db, run, "cancellation requested")
+                return
+            run.state = state
+            run.error_message = error_message
+            run.completed_at = datetime.now(UTC)
+            append_run_event(
+                db,
+                run.id,
+                "run_timed_out" if state is RunState.TIMED_OUT else "run_failed",
+                {"state": state.value, "error": error_message},
+            )
+            db.commit()
+    except Exception:
+        # There is no safe state transition when the persistence layer itself
+        # is unavailable, but keep the daemon worker from dying silently.
+        logger.exception("could not persist terminal run state", extra={"run_id": run_id})

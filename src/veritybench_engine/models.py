@@ -73,6 +73,7 @@ class TraceEventType(str, Enum):
 
 ExecutionEventType = TraceEventType
 EXECUTION_EVENT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 1
 
 
 class LedgerEntryType(str, Enum):
@@ -306,9 +307,15 @@ class EvaluationReport:
     passed: bool
     invariants: tuple[InvariantResult, ...]
     findings: tuple[Finding, ...]
+    report_version: int = REPORT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.report_version < 1:
+            raise ValueError("evaluation report_version must be positive")
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "report_version": self.report_version,
             "passed": self.passed,
             "invariants": [
                 {"name": item.name, "passed": item.passed, "evidence": list(item.evidence)}
@@ -332,6 +339,7 @@ class SimulationResult:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "report_version": self.evaluation.report_version,
             "agent_name": self.agent_name,
             "scenario": self.scenario.value,
             "order": {

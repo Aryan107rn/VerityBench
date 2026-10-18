@@ -24,6 +24,16 @@ def test_cli_runs_safe_recovery_and_reads_report(cli_cwd) -> None:
     assert "PASS" in shown.stdout
 
 
+def test_cli_agent_init_writes_a_valid_starter(tmp_path) -> None:
+    target = tmp_path / "my-agent.py"
+    created = runner.invoke(app, ["agent", "init", str(target)])
+
+    assert created.exit_code == 0, created.stdout
+    source = target.read_text()
+    assert "AGENT_CONTRACT_VERSION = 1" in source
+    assert "def create_agent" in source
+
+
 def test_cli_returns_failure_exit_code_for_defective_agent(cli_cwd) -> None:
     assert runner.invoke(app, ["init"]).exit_code == 0
     tested = runner.invoke(

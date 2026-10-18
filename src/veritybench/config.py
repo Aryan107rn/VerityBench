@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     veritybench_cors_origins: str = "http://localhost:5173"
     veritybench_session_ttl_hours: int = 24
     veritybench_max_run_steps: int = 20
+    veritybench_agent_artifact_dir: str = ".veritybench-agent-artifacts"
+    veritybench_agent_max_source_bytes: int = 256_000
+    veritybench_remote_run_timeout_seconds: float = 30.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
@@ -33,6 +36,20 @@ class Settings(BaseSettings):
     def validate_max_steps(cls, value: int) -> int:
         if not 1 <= value <= 100:
             raise ValueError("maximum run steps must be between 1 and 100")
+        return value
+
+    @field_validator("veritybench_agent_max_source_bytes")
+    @classmethod
+    def validate_agent_source_size(cls, value: int) -> int:
+        if not 1_024 <= value <= 1_048_576:
+            raise ValueError("agent source limit must be between 1024 and 1048576 bytes")
+        return value
+
+    @field_validator("veritybench_remote_run_timeout_seconds")
+    @classmethod
+    def validate_remote_timeout(cls, value: float) -> float:
+        if not 1 <= value <= 300:
+            raise ValueError("remote run timeout must be between 1 and 300 seconds")
         return value
 
 

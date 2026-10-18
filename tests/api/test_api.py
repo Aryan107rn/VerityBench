@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from veritybench.api import main as api_main
 from veritybench.api.main import app
+from veritybench.models import Run
 from veritybench_engine import DeterministicEngine, ExecutionCancelled
 
 
@@ -22,6 +25,20 @@ def register(client: TestClient, email: str) -> tuple[str, str]:
 
 def auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_legacy_report_without_version_remains_readable() -> None:
+    legacy_report = {"agent_name": "legacy-agent", "evaluation": {"passed": True}}
+    run = Run(
+        id="legacy-run",
+        project_id="project",
+        state="passed",
+        agent="safe",
+        scenario="normal",
+        report_json=json.dumps(legacy_report),
+    )
+
+    assert api_main._load_run_report(run) == legacy_report
 
 
 def wait_for_terminal(client: TestClient, run_id: str, headers: dict[str, str]) -> dict:
@@ -56,6 +73,8 @@ def test_project_run_report_persists_and_uses_independent_engine() -> None:
         assert queued_run["state"] in {"queued", "running", "failed"}
         run = wait_for_terminal(client, queued_run["id"], headers)
         assert run["state"] == "failed"
+        assert run["report"]["report_version"] == 1
+        assert run["report"]["run_state"] == "failed"
         assert run["report"]["metrics"]["duplicate_charges"] == 1
         assert run["report"]["evaluation"]["passed"] is False
 
@@ -262,6 +281,51 @@ def test_project_agent_registry_is_authenticated_and_repository_scoped() -> None
         )
 
 
+def test_remote_agent_registration_is_stored_without_api_execution(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_main,
+        "settings",
+        api_main.settings.model_copy(update={"veritybench_agent_artifact_dir": str(tmp_path)}),
+    )
+    source = """\nAGENT_CONTRACT_VERSION = 1\n\ndef create_agent():\n    raise RuntimeError('must execute only in the worker')\n"""
+    with TestClient(app) as client:
+        token, _ = register(client, "remote-agent@example.test")
+        headers = auth(token)
+        project_id = client.post(
+            "/api/v1/projects", headers=headers, json={"name": "remote"}
+        ).json()["id"]
+
+        registration = client.post(
+            f"/api/v1/projects/{project_id}/agents",
+            headers=headers,
+            json={"name": "checkout-agent", "version": "1.0.0", "source": source},
+        )
+        assert registration.status_code == 201, registration.text
+        metadata = registration.json()
+        assert metadata["source_size"] == len(source.encode())
+        assert (tmp_path / f"{metadata['id']}.py").read_text() == source
+
+        registry = client.get(f"/api/v1/projects/{project_id}/agents", headers=headers).json()
+        custom = next(item for item in registry if item["key"] == f"remote:{metadata['id']}")
+        assert custom["source"] == "remote"
+        assert custom["runnable"] is True
+
+        queued = client.post(
+            f"/api/v1/projects/{project_id}/runs",
+            headers=headers,
+            json={"agent": f"remote:{metadata['id']}", "scenario": "normal"},
+        )
+        assert queued.status_code == 201, queued.text
+        assert queued.json()["state"] == "queued"
+        time.sleep(0.03)
+        assert client.get(f"/api/v1/runs/{queued.json()['id']}", headers=headers).json()["state"] == "queued"
+
+        disabled = client.delete(
+            f"/api/v1/projects/{project_id}/agents/{metadata['id']}", headers=headers
+        )
+        assert disabled.status_code == 204
+
+
 def test_cancellation_is_persisted_and_transitions_a_running_run(monkeypatch) -> None:
     started = threading.Event()
 
@@ -297,3 +361,56 @@ def test_cancellation_is_persisted_and_transitions_a_running_run(monkeypatch) ->
             "run_cancel_requested",
             "run_cancelled",
         ]
+
+
+def test_exhausting_the_bounded_engine_is_reported_as_timed_out(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "auth_limiter", api_main.AuthRateLimiter())
+    monkeypatch.setattr(
+        api_main,
+        "settings",
+        api_main.settings.model_copy(update={"veritybench_max_run_steps": 1}),
+    )
+    with TestClient(app) as client:
+        token, _ = register(client, "bounded-timeout@example.test")
+        headers = auth(token)
+        project_id = client.post(
+            "/api/v1/projects", headers=headers, json={"name": "bounded-timeout"}
+        ).json()["id"]
+        queued = client.post(
+            f"/api/v1/projects/{project_id}/runs",
+            headers=headers,
+            json={"agent": "safe", "scenario": "normal"},
+        ).json()
+
+        run = wait_for_terminal(client, queued["id"], headers)
+
+        assert run["state"] == "timed_out"
+        assert run["report"]["run_state"] == "timed_out"
+        assert run["report"]["order"]["status"] == "paid"
+
+
+def test_worker_exception_is_reported_as_inconclusive(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "auth_limiter", api_main.AuthRateLimiter())
+
+    class BrokenEngine(DeterministicEngine):
+        def run(self, agent, *, on_event=None, should_cancel=None):
+            raise RuntimeError("synthetic engine failure")
+
+    monkeypatch.setattr(api_main, "DeterministicEngine", BrokenEngine)
+    with TestClient(app) as client:
+        token, _ = register(client, "inconclusive@example.test")
+        headers = auth(token)
+        project_id = client.post(
+            "/api/v1/projects", headers=headers, json={"name": "inconclusive"}
+        ).json()["id"]
+        queued = client.post(
+            f"/api/v1/projects/{project_id}/runs",
+            headers=headers,
+            json={"agent": "safe", "scenario": "normal"},
+        ).json()
+
+        run = wait_for_terminal(client, queued["id"], headers)
+
+        assert run["state"] == "inconclusive"
+        assert run["report"] is None
+        assert run["error_message"] == "execution failed: RuntimeError"

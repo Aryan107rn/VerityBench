@@ -4,8 +4,8 @@ Revision ID: 002_run_events
 Revises: 001_initial
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "002_run_events"
 down_revision = "001_initial"

@@ -90,6 +90,7 @@ veritybench init --force       # replace an existing veritybench.toml
 veritybench validate
 veritybench agents list --json
 veritybench scenarios list --json
+veritybench agent init ./my-agent.py
 ```
 
 `init` creates `veritybench.toml` and `runs/`. The generated project defaults
@@ -116,9 +117,11 @@ veritybench test --agent-path ./my_agent.py --timeout 20 --json \
 scenarios as a local suite. Use `--scenario`, `--agent`, `--output`, and
 `--json` to select the behavior, sample agent, destination, and output format.
 Use `--agent-path` instead of `--agent` to run a version-1 custom Python agent
-in a separate local subprocess. The default worker timeout is 10 seconds;
-`--timeout` changes it for trusted local code. A normal custom-agent run shows
-live engine events; `--json` prints only the final valid JSON report.
+in a Docker container. Docker is required, and `VERITYBENCH_AGENT_IMAGE` must
+name a locally available `name@sha256:<64 lowercase hex characters>` image;
+mutable tags and host execution are refused. The default worker timeout is 10
+seconds; `--timeout` changes it. A normal custom-agent run shows live engine
+events; `--json` prints only the final valid JSON report.
 The supported scenarios are:
 
 - `normal` — the payment succeeds normally.
@@ -174,20 +177,18 @@ veritybench sync --project-id PROJECT_ID \
 `login` prompts for the email and hidden password, then stores the short-lived
 session token at `~/.config/veritybench/session.json` with mode `0600`.
 `sync` requires that login and a project ID, supplied with `--project-id` or
-`[api].project_id` in `veritybench.toml`; it prints the persisted API response
-and exits 1 when the API run is not passed. These commands still support only
-the two sample agents and the five local scenarios. `--agent-path` is never
-forwarded to the API.
+`[api].project_id` in `veritybench.toml`; it waits for the asynchronous API run
+to reach a terminal state and exits 1 when the API run is not passed. Use
+`--wait-timeout` to bound the client wait; a client timeout exits 124. Remote
+registered agents are submitted by their `remote:<agent-id>` key after the
+separate worker is configured. `--agent-path` is never forwarded to the API.
 
 ## Local Python agent boundary
 
-The versioned Python contract, copyable example, subprocess limits, structured
+The versioned Python contract, copyable example, Docker policy, structured
 event protocol, and diagnostics are documented in
-[AGENT_CONTRACT.md](AGENT_CONTRACT.md). Custom code runs only in the CLI's
-local worker. It is not loaded by FastAPI and is not a hostile-code sandbox:
-there are no network or filesystem restrictions inside the worker, so run
-trusted code and keep API credentials out of the agent directory. The API
-continues to instantiate only the repository-owned sample agents.
+[AGENT_CONTRACT.md](AGENT_CONTRACT.md). Custom code runs in the CLI's or the
+separate remote worker's Docker boundary. It is not loaded by FastAPI.
 
 ## Adding an adapter
 

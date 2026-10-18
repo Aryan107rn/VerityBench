@@ -18,6 +18,16 @@ from .models import (
 )
 
 
+def _event_attribute(event: TraceEvent, *names: str) -> str | None:
+    """Read a non-empty text attribute, accepting both JSON naming styles."""
+
+    for name in names:
+        value = event.attributes.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def compute_metrics(trace: Iterable[TraceEvent], ledger: Ledger) -> Metrics:
     """Derive metrics solely from observable trace events and ledger entries."""
 
@@ -69,24 +79,73 @@ def evaluate_state(order: Order, ledger: Ledger, trace: Iterable[TraceEvent]) ->
     reconciliation_events = tuple(
         event for event in events if event.event_type is TraceEventType.PAYMENT_RECONCILED
     )
+    successful_payment_events = tuple(
+        event for event in events if event.event_type is TraceEventType.PAYMENT_SUCCEEDED
+    )
 
     findings: list[Finding] = []
     invariants: list[InvariantResult] = []
 
-    single_settlement = not success_state or (
+    settlement_shape = (
         len(charges) == 1
         and charges[0].amount == order.amount
         and charges[0].currency == order.currency
+    )
+    payment_id_match = (
+        settlement_shape
+        and bool(order.payment_id)
+        and charges[0].payment_id == order.payment_id
+        and all(
+            _event_attribute(event, "payment_id", "payment-id") in {None, order.payment_id}
+            for event in successful_payment_events
+        )
+    )
+    idempotency_key_match = (
+        settlement_shape
+        and bool(order.idempotency_key)
+        and charges[0].idempotency_key == order.idempotency_key
+        and all(
+            _event_attribute(event, "idempotency_key", "idempotency-key")
+            in {None, order.idempotency_key}
+            for event in successful_payment_events
+        )
+    )
+    single_settlement = not success_state or (
+        settlement_shape and payment_id_match and idempotency_key_match
     )
     settlement_evidence = tuple(
         f"ledger entry {entry.entry_id}: {entry.amount} {entry.currency}"
         for entry in charges
     )
+    settlement_identity_evidence = (
+        f"order payment_id: {order.payment_id or '<missing>'}",
+        f"order idempotency_key: {order.idempotency_key or '<missing>'}",
+        *(
+            (
+                f"settled payment_id: {charges[0].payment_id}",
+                f"settled idempotency_key: {charges[0].idempotency_key}",
+            )
+            if settlement_shape
+            else ()
+        ),
+        *tuple(
+            f"trace[{event.index}] successful payment_id: "
+            f"{_event_attribute(event, 'payment_id', 'payment-id') or '<omitted>'}"
+            for event in successful_payment_events
+            if _event_attribute(event, "payment_id", "payment-id") is not None
+        ),
+        *tuple(
+            f"trace[{event.index}] successful idempotency_key: "
+            f"{_event_attribute(event, 'idempotency_key', 'idempotency-key') or '<omitted>'}"
+            for event in successful_payment_events
+            if _event_attribute(event, "idempotency_key", "idempotency-key") is not None
+        ),
+    )
     invariants.append(
         InvariantResult(
             name="successful order has exactly one matching settlement",
             passed=single_settlement,
-            evidence=settlement_evidence,
+            evidence=(*settlement_evidence, *settlement_identity_evidence),
         )
     )
     if success_state and not single_settlement:
@@ -95,8 +154,34 @@ def evaluate_state(order: Order, ledger: Ledger, trace: Iterable[TraceEvent]) ->
                 code="SETTLEMENT_MISMATCH",
                 severity=FindingSeverity.ERROR,
                 title="Successful order does not have one matching settlement",
-                evidence=settlement_evidence or (f"order status is {order.status.value}",),
+                evidence=(
+                    *settlement_evidence,
+                    *settlement_identity_evidence,
+                    f"order status is {order.status.value}",
+                ),
                 recommendation="Require a single settled charge for the exact order amount before fulfillment.",
+            )
+        )
+
+    if success_state and not payment_id_match:
+        findings.append(
+            Finding(
+                code="PAYMENT_ID_MISMATCH",
+                severity=FindingSeverity.ERROR,
+                title="Successful order payment id does not match its settlement",
+                evidence=settlement_identity_evidence,
+                recommendation="Require the final order payment_id to equal the settled ledger payment_id.",
+            )
+        )
+
+    if success_state and not idempotency_key_match:
+        findings.append(
+            Finding(
+                code="IDEMPOTENCY_KEY_MISMATCH",
+                severity=FindingSeverity.ERROR,
+                title="Successful settlement does not use the order idempotency key",
+                evidence=settlement_identity_evidence,
+                recommendation="Require the settled charge to use the original order idempotency key.",
             )
         )
 
@@ -158,7 +243,43 @@ def evaluate_state(order: Order, ledger: Ledger, trace: Iterable[TraceEvent]) ->
             )
         )
 
-    timeout_recovered = not timeout_events or bool(reconciliation_events)
+    reconciliation_evidence: list[str] = []
+    timeout_recovered = True
+    for timeout_event in timeout_events:
+        timeout_key = _event_attribute(timeout_event, "idempotency_key", "idempotency-key")
+        timeout_key_is_original = (
+            timeout_key is not None
+            and bool(order.idempotency_key)
+            and timeout_key == order.idempotency_key
+        )
+        matching_reconciliation = next(
+            (
+                event
+                for event in reconciliation_events
+                if event.index > timeout_event.index
+                and _event_attribute(event, "outcome") == "success"
+                and timeout_key_is_original
+                and _event_attribute(event, "idempotency_key", "idempotency-key") == timeout_key
+                and any(
+                    entry.payment_id == _event_attribute(event, "payment_id", "payment-id")
+                    and entry.idempotency_key == order.idempotency_key
+                    for entry in charges
+                )
+            ),
+            None,
+        )
+        if matching_reconciliation is None:
+            timeout_recovered = False
+            reconciliation_evidence.append(
+                f"trace[{timeout_event.index}] has no successful reconciliation for "
+                f"original idempotency_key {order.idempotency_key or '<missing>'}; "
+                f"observed {timeout_key or '<missing>'}"
+            )
+        else:
+            reconciliation_evidence.append(
+                f"trace[{matching_reconciliation.index}] reconciled successfully with "
+                f"idempotency_key {timeout_key}"
+            )
     timeout_evidence = tuple(
         f"trace[{event.index}] {event.event_type.value}" for event in timeout_events
     )
@@ -166,7 +287,7 @@ def evaluate_state(order: Order, ledger: Ledger, trace: Iterable[TraceEvent]) ->
         InvariantResult(
             name="timed-out payment is reconciled before completion",
             passed=timeout_recovered,
-            evidence=timeout_evidence,
+            evidence=(*timeout_evidence, *reconciliation_evidence),
         )
     )
     if not timeout_recovered:
@@ -175,7 +296,7 @@ def evaluate_state(order: Order, ledger: Ledger, trace: Iterable[TraceEvent]) ->
                 code="UNRECOVERED_PAYMENT_TIMEOUT",
                 severity=FindingSeverity.ERROR,
                 title="Payment timed out without reconciliation",
-                evidence=timeout_evidence,
+                evidence=(*timeout_evidence, *reconciliation_evidence),
                 recommendation="Query the provider using the original idempotency key before retrying or canceling.",
             )
         )

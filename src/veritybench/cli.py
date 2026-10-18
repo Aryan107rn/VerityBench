@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import shutil
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -26,7 +27,8 @@ from veritybench_engine import (
     simulate,
 )
 
-from .local_worker import LocalWorkerError, run_local_agent
+from .local_worker import LocalWorkerError
+from .local_worker import run_sandboxed_agent as run_local_agent
 
 app = typer.Typer(
     name="veritybench",
@@ -35,15 +37,48 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 agents_app = typer.Typer(help="Inspect supported local agent modes.")
+agent_app = typer.Typer(help="Create a compatible Python agent.")
 scenarios_app = typer.Typer(help="Inspect deterministic evaluation scenarios.")
 runs_app = typer.Typer(help="List and inspect saved local reports.", invoke_without_command=True)
 app.add_typer(agents_app, name="agents")
+app.add_typer(agent_app, name="agent")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(runs_app, name="runs")
 
 CONFIG_FILE = Path("veritybench.toml")
 RUNS_DIR = Path("runs")
 SESSION_FILE = Path.home() / ".config" / "veritybench" / "session.json"
+AGENT_TEMPLATE = '''"""VerityBench Python agent starter."""
+
+from veritybench_engine import AgentAction, AgentContext, AgentDecision, OrderStatus, PaymentOutcome
+
+AGENT_CONTRACT_VERSION = 1
+
+
+class MyAgent:
+    name = "my-agent"
+
+    def decide(self, context: AgentContext) -> AgentDecision:
+        if context.order.status is OrderStatus.CREATED:
+            return AgentDecision(
+                action=AgentAction.START_PAYMENT,
+                idempotency_key=context.order.idempotency_key,
+                rationale="start payment with a stable idempotency key",
+            )
+        if context.order.status is OrderStatus.PAYMENT_PENDING and context.last_outcome is PaymentOutcome.TIMEOUT:
+            return AgentDecision(
+                action=AgentAction.RECONCILE_PAYMENT,
+                idempotency_key=context.order.idempotency_key,
+                rationale="reconcile an uncertain payment before retrying",
+            )
+        if context.order.status is OrderStatus.PAID:
+            return AgentDecision(action=AgentAction.FULFILL_ORDER, rationale="fulfill a settled payment")
+        return AgentDecision(action=AgentAction.CANCEL_ORDER, rationale="stop on an unsafe or failed state")
+
+
+def create_agent() -> MyAgent:
+    return MyAgent()
+'''
 DEMO_DEFECTIVE_REPORT = RUNS_DIR / "demo-defective-timeout.json"
 DEMO_SAFE_REPORT = RUNS_DIR / "demo-safe-recovery.json"
 
@@ -225,7 +260,10 @@ def test(
     agent: Annotated[str | None, typer.Option(help="safe or defective sample agent.")] = None,
     agent_path: Annotated[
         Path | None,
-        typer.Option("--agent-path", help="Path to a version-1 local Python agent module."),
+        typer.Option(
+            "--agent-path",
+            help="Path to a version-1 Python agent; requires Docker and a pinned VERITYBENCH_AGENT_IMAGE.",
+        ),
     ] = None,
     timeout: Annotated[float, typer.Option(help="Local-agent subprocess timeout in seconds.")] = 10.0,
     output: Annotated[Path, typer.Option(help="Where to write the JSON report.")] = RUNS_DIR / "latest.json",
@@ -233,8 +271,9 @@ def test(
 ) -> None:
     """Execute one bounded local evaluation and save its evidence.
 
-    ``--agent-path`` loads a documented Python agent in a separate local
-    subprocess. It is intentionally unavailable to API executions.
+    ``--agent-path`` runs a documented Python agent in a hardened Docker
+    container. Docker is required; it is intentionally unavailable to API
+    executions.
     """
 
     config = _load_config()
@@ -284,6 +323,21 @@ def test(
         raise typer.Exit(1)
 
 
+@agent_app.command("init")
+def init_agent(
+    path: Annotated[Path, typer.Argument(help="Python file or directory for the starter agent.")],
+    force: Annotated[bool, typer.Option("--force", help="Replace an existing starter file.")] = False,
+) -> None:
+    """Create a valid version-1 Python agent starter module."""
+
+    target = path / "agent.py" if path.suffix.lower() != ".py" else path
+    if target.exists() and not force:
+        _fail(f"agent file already exists: {target}; pass --force to replace it")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(AGENT_TEMPLATE, encoding="utf-8")
+    typer.echo(f"Created {target}")
+
+
 @agents_app.command("list")
 def list_agents(
     as_json: Annotated[bool, typer.Option("--json", help="Print a JSON agent catalog.")] = False,
@@ -310,7 +364,7 @@ def list_agents(
             "name": "local Python contract agent",
             "kind": "python-module",
             "scope": "cli-local-only",
-            "description": "Loads --agent-path in a bounded subprocess; never runs in FastAPI.",
+            "description": "Runs --agent-path in hardened Docker; never runs in FastAPI.",
         },
     ]
     if as_json:
@@ -554,8 +608,9 @@ def sync(
     project_id: Annotated[str | None, typer.Option(help="API project ID; defaults to local config.")] = None,
     scenario: Annotated[str | None, typer.Option(help="Scenario to execute on the API.")] = None,
     agent: Annotated[str | None, typer.Option(help="safe or defective sample agent.")] = None,
+    wait_timeout: Annotated[float, typer.Option(help="Maximum seconds to wait for the remote run.")] = 60.0,
 ) -> None:
-    """Run the same supported sample scenario through the authenticated API."""
+    """Run a supported sample scenario and wait for its terminal API result."""
 
     config = _load_config()
     project = _section(config, "project")
@@ -568,12 +623,15 @@ def sync(
     session = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
     selected_scenario = scenario or str(project.get("scenario", "normal"))
     selected_agent = agent or str(project.get("agent", "safe"))
+    if wait_timeout <= 0:
+        _fail("wait timeout must be greater than zero seconds")
     body = json.dumps({"scenario": selected_scenario, "agent": selected_agent}).encode("utf-8")
     base_url = _api_base_url(str(session["base_url"]))
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {session['access_token']}"}
     request = urllib.request.Request(
         f"{base_url}/api/v1/projects/{selected_project}/runs",
         data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {session['access_token']}"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -581,6 +639,27 @@ def sync(
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         _fail(f"sync request failed: {exc}", 1)
+    run_id = payload.get("id")
+    if not isinstance(run_id, str) or not run_id:
+        _fail("sync response did not include a run id", 1)
+
+    terminal_states = {"passed", "failed", "cancelled", "timed_out", "inconclusive"}
+    deadline = time.monotonic() + wait_timeout
+    while payload.get("state") not in terminal_states and time.monotonic() < deadline:
+        time.sleep(0.25)
+        status_request = urllib.request.Request(
+            f"{base_url}/api/v1/runs/{urllib.parse.quote(run_id, safe='')}",
+            headers={"Authorization": f"Bearer {session['access_token']}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(status_request, timeout=10) as response:  # nosec B310
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+            _fail(f"sync status request failed: {exc}", 1)
+
+    if payload.get("state") not in terminal_states:
+        _fail(f"remote run {run_id} did not finish within {wait_timeout:g} seconds", 124)
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     if payload.get("state") != "passed":
         raise typer.Exit(1)

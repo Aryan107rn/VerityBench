@@ -5,9 +5,9 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from veritybench import models  # noqa: F401
 from veritybench.config import get_settings
 from veritybench.db import Base
-from veritybench import models  # noqa: F401
 
 config = context.config
 settings = get_settings()

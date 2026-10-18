@@ -156,6 +156,160 @@ def test_evaluation_can_run_against_an_independently_constructed_bad_snapshot():
     }
 
 
+def test_successful_snapshot_requires_matching_payment_id_and_original_key():
+    order = Order(
+        order_id="order-identity",
+        amount=100,
+        currency="USD",
+        status=OrderStatus.FULFILLED,
+        payment_id="payment-order-identity-001",
+        idempotency_key="payment:order-identity",
+    )
+    ledger = Ledger(
+        entries=(
+            LedgerEntry(
+                entry_id="ledger-001",
+                order_id=order.order_id,
+                payment_id="payment-order-identity-002",
+                amount=order.amount,
+                currency=order.currency,
+                entry_type=LedgerEntryType.CHARGE,
+                idempotency_key="payment:order-identity:retry:2",
+            ),
+        )
+    )
+
+    report = evaluate_state(order, ledger, ())
+
+    assert not report.passed
+    assert {item.code for item in report.findings} >= {
+        "SETTLEMENT_MISMATCH",
+        "PAYMENT_ID_MISMATCH",
+        "IDEMPOTENCY_KEY_MISMATCH",
+    }
+
+
+def test_success_event_identity_must_agree_with_the_settlement():
+    order = Order(
+        order_id="order-event-identity",
+        amount=100,
+        currency="USD",
+        status=OrderStatus.PAID,
+        payment_id="payment-order-event-identity-001",
+        idempotency_key="payment:order-event-identity",
+    )
+    ledger = Ledger(
+        entries=(
+            LedgerEntry(
+                entry_id="ledger-001",
+                order_id=order.order_id,
+                payment_id=order.payment_id,
+                amount=order.amount,
+                currency=order.currency,
+                entry_type=LedgerEntryType.CHARGE,
+                idempotency_key=order.idempotency_key,
+            ),
+        )
+    )
+    trace = (
+        ExecutionEvent(
+            index=0,
+            tick=0,
+            event_type=TraceEventType.PAYMENT_SUCCEEDED,
+            order_id=order.order_id,
+            attributes={
+                "payment_id": "payment-order-event-identity-wrong",
+                "idempotency_key": order.idempotency_key,
+            },
+        ),
+    )
+
+    report = evaluate_state(order, ledger, trace)
+
+    assert not report.passed
+    assert any(item.code == "PAYMENT_ID_MISMATCH" for item in report.findings)
+
+
+@pytest.mark.parametrize(
+    "timeout_key, reconciliation_attributes",
+    [
+        (
+            "payment:order-timeout",
+            {
+                "outcome": "temporary_failure",
+                "idempotency_key": "payment:order-timeout",
+                "payment_id": "payment-order-timeout-001",
+            },
+        ),
+        (
+            "payment:order-timeout",
+            {
+                "outcome": "success",
+                "idempotency_key": "payment:order-timeout:wrong-key",
+                "payment_id": "payment-order-timeout-001",
+            },
+        ),
+        (
+            "payment:order-timeout:retry:2",
+            {
+                "outcome": "success",
+                "idempotency_key": "payment:order-timeout:retry:2",
+                "payment_id": "payment-order-timeout-001",
+            },
+        ),
+    ],
+)
+def test_timeout_reconciliation_must_succeed_for_the_original_key(
+    timeout_key, reconciliation_attributes
+):
+    order = Order(
+        order_id="order-timeout",
+        amount=100,
+        currency="USD",
+        status=OrderStatus.FULFILLED,
+        payment_id="payment-order-timeout-001",
+        idempotency_key="payment:order-timeout",
+    )
+    ledger = Ledger(
+        entries=(
+            LedgerEntry(
+                entry_id="ledger-001",
+                order_id=order.order_id,
+                payment_id=order.payment_id or "",
+                amount=order.amount,
+                currency=order.currency,
+                entry_type=LedgerEntryType.CHARGE,
+                idempotency_key=order.idempotency_key,
+            ),
+        )
+    )
+    trace = (
+        ExecutionEvent(
+            index=0,
+            tick=0,
+            event_type=TraceEventType.PAYMENT_TIMEOUT,
+            order_id=order.order_id,
+            attributes={"idempotency_key": timeout_key},
+        ),
+        ExecutionEvent(
+            index=1,
+            tick=1,
+            event_type=TraceEventType.PAYMENT_RECONCILED,
+            order_id=order.order_id,
+            attributes=reconciliation_attributes,
+        ),
+    )
+
+    report = evaluate_state(order, ledger, trace)
+
+    assert not report.passed
+    timeout_check = next(
+        item for item in report.invariants if item.name == "timed-out payment is reconciled before completion"
+    )
+    assert not timeout_check.passed
+    assert any(item.code == "UNRECOVERED_PAYMENT_TIMEOUT" for item in report.findings)
+
+
 def test_runs_are_byte_for_byte_stable_as_serializable_records():
     first = simulate(FaultScenario.TIMEOUT_AFTER_SUCCESS).to_dict()
     second = simulate(FaultScenario.TIMEOUT_AFTER_SUCCESS).to_dict()

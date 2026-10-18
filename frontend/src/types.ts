@@ -1,6 +1,17 @@
 export type View = 'overview' | 'dashboard' | 'run' | 'agents' | 'datasets' | 'evaluators' | 'settings' | 'cli'
 
-export type RunStatus = 'completed' | 'running' | 'needs-review'
+/** States returned by the persisted execution API, plus legacy fixture labels. */
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'cancel_requested'
+  | 'passed'
+  | 'failed'
+  | 'timed_out'
+  | 'inconclusive'
+  | 'cancelled'
+  | 'completed'
+  | 'needs-review'
 
 export type Run = {
   id: string

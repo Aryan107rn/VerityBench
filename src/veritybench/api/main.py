@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -21,6 +24,7 @@ from sqlalchemy.orm import Session
 from veritybench_engine import (
     DefectiveSampleAgent,
     DeterministicEngine,
+    FaultScenario,
     SafeSampleAgent,
 )
 
@@ -30,10 +34,12 @@ from ..config import get_settings
 from ..db import SessionLocal, get_db, init_db
 from ..db_types import RunState
 from ..execution import append_run_event, run_event_lock, submit_run
-from ..models import Project, Run, RunEvent, User
+from ..models import AgentRegistration, Project, Run, RunEvent, User
 from ..rate_limit import AuthRateLimiter
 from ..schemas import (
     AgentMetadata,
+    AgentRegistrationRequest,
+    AgentRegistrationResponse,
     HealthResponse,
     LoginRequest,
     ProjectCreateRequest,
@@ -41,7 +47,9 @@ from ..schemas import (
     RegisterRequest,
     RunCreateRequest,
     RunEventResponse,
+    RunReport,
     RunResponse,
+    RunStateValue,
     RunSummary,
     SessionResponse,
     UserResponse,
@@ -75,6 +83,29 @@ SAMPLE_AGENT_METADATA = [
     ),
 ]
 
+
+def _agent_key(registration_id: str) -> str:
+    return f"remote:{registration_id}"
+
+
+def _artifact_root() -> Path:
+    root = Path(settings.veritybench_agent_artifact_dir).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def _remote_agent_metadata(registration: AgentRegistration) -> AgentMetadata:
+    return AgentMetadata(
+        key=_agent_key(registration.id),
+        name=registration.name,
+        version=registration.version,
+        description="Project-registered Python agent executed by the isolated worker.",
+        source="remote",
+        runnable=registration.enabled,
+        status="enabled" if registration.enabled else "disabled",
+        supported_scenarios=[scenario.value for scenario in FaultScenario],
+    )
+
 app = FastAPI(
     title="VerityBench API",
     version=__version__,
@@ -85,7 +116,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
@@ -236,11 +267,11 @@ def get_project(
 
 
 def _run_response(run: Run) -> RunResponse:
-    report = json.loads(run.report_json) if run.report_json else None
+    report = _load_run_report(run)
     return RunResponse(
         id=run.id,
         project_id=run.project_id,
-        state=run.state,
+        state=cast(RunStateValue, run.state),
         agent=run.agent,
         scenario=run.scenario,
         cancel_requested=run.cancel_requested,
@@ -250,6 +281,30 @@ def _run_response(run: Run) -> RunResponse:
         report=report,
         error_message=run.error_message,
     )
+
+
+def _load_run_report(run: Run) -> dict[str, object] | None:
+    """Validate a stored report without changing legacy report JSON shapes."""
+
+    if not run.report_json:
+        return None
+    try:
+        raw_report = json.loads(run.report_json)
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("stored run report is not valid JSON", extra={"run_id": run.id})
+        return None
+    if not isinstance(raw_report, dict):
+        logger.warning("stored run report is not an object", extra={"run_id": run.id})
+        return None
+    try:
+        validated = RunReport.model_validate(raw_report)
+    except ValidationError:
+        logger.warning("stored run report failed validation", extra={"run_id": run.id})
+        return None
+    if validated.run_state is not None and validated.run_state != run.state:
+        logger.warning("stored run report state disagrees with run state", extra={"run_id": run.id})
+        return None
+    return cast(dict[str, object], raw_report)
 
 
 def _run_event_response(event: RunEvent) -> RunEventResponse:
@@ -284,11 +339,22 @@ def create_run(
 ) -> RunResponse:
     owned_project(project_id, user, db)
     agent_factory = SAMPLE_AGENT_FACTORIES.get(payload.agent)
+    registration: AgentRegistration | None = None
     if agent_factory is None:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported sample agent")
+        registration_id = payload.agent.removeprefix("remote:")
+        registration = db.scalar(
+            select(AgentRegistration).where(
+                AgentRegistration.id == registration_id,
+                AgentRegistration.project_id == project_id,
+                AgentRegistration.enabled.is_(True),
+            )
+        )
+        if registration is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid request")
     run = Run(
         id=str(uuid4()),
         project_id=project_id,
+        agent_registration_id=registration.id if registration is not None else None,
         state=RunState.QUEUED,
         agent=payload.agent,
         scenario=payload.scenario.value,
@@ -307,13 +373,14 @@ def create_run(
         )
         db.commit()
     db.refresh(run)
-    submit_run(
-        run.id,
-        payload.scenario,
-        agent_factory,
-        settings.veritybench_max_run_steps,
-        engine_factory=DeterministicEngine,
-    )
+    if agent_factory is not None:
+        submit_run(
+            run.id,
+            payload.scenario,
+            agent_factory,
+            settings.veritybench_max_run_steps,
+            engine_factory=DeterministicEngine,
+        )
     return _run_response(run)
 
 
@@ -351,7 +418,88 @@ def list_agents(
     db: Session = Depends(get_db),
 ) -> list[AgentMetadata]:
     owned_project(project_id, user, db)
-    return SAMPLE_AGENT_METADATA
+    registrations = db.scalars(
+        select(AgentRegistration)
+        .where(AgentRegistration.project_id == project_id)
+        .order_by(AgentRegistration.created_at.desc(), AgentRegistration.id.desc())
+    )
+    return [*SAMPLE_AGENT_METADATA, *(_remote_agent_metadata(item) for item in registrations)]
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/agents",
+    response_model=AgentRegistrationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_agent(
+    project_id: str,
+    payload: AgentRegistrationRequest,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> AgentRegistration:
+    """Store source bytes as an artifact; the API never imports or executes them."""
+
+    owned_project(project_id, user, db)
+    source_bytes = payload.source.encode("utf-8")
+    if len(source_bytes) > settings.veritybench_agent_max_source_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="agent source is too large",
+        )
+    agent_id = str(uuid4())
+    digest = hashlib.sha256(source_bytes).hexdigest()
+    root = _artifact_root()
+    artifact = root / f"{agent_id}.py"
+    try:
+        artifact.write_bytes(source_bytes)
+    except OSError as exc:
+        logger.exception("could not store remote agent artifact", extra={"agent_id": agent_id})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="agent artifact storage unavailable",
+        ) from exc
+    registration = AgentRegistration(
+        id=agent_id,
+        project_id=project_id,
+        name=payload.name,
+        version=payload.version,
+        source_path=str(artifact),
+        source_sha256=digest,
+        source_size=len(source_bytes),
+        contract_version=payload.contract_version,
+    )
+    db.add(registration)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        artifact.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="agent name/version already registered",
+        ) from exc
+    db.refresh(registration)
+    return registration
+
+
+@app.delete("/api/v1/projects/{project_id}/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
+def disable_agent(
+    project_id: str,
+    agent_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    owned_project(project_id, user, db)
+    registration = db.scalar(
+        select(AgentRegistration).where(
+            AgentRegistration.id == agent_id,
+            AgentRegistration.project_id == project_id,
+        )
+    )
+    if registration is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="agent not found")
+    registration.enabled = False
+    db.commit()
 
 
 @app.get("/api/v1/runs/{run_id}/events", response_model=list[RunEventResponse])

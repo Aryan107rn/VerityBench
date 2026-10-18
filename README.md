@@ -23,17 +23,23 @@ through the API:
 The CLI also supports a local Python agent module through `--agent-path`. The
 module must implement the versioned contract in
 [docs/AGENT_CONTRACT.md](docs/AGENT_CONTRACT.md), and it is loaded only in a
-bounded subprocess. Custom Python is CLI-local-only: the FastAPI process does
-not import or execute it, and API runs continue to accept only the sample
-agents. This worker is a process boundary, not a hostile-code sandbox; run
-only code you trust and do not put API credentials in the agent directory.
+Docker container. Docker and a locally available digest-pinned image configured
+as `VERITYBENCH_AGENT_IMAGE` are required; there is no host-execution fallback.
+Custom Python can also be explicitly registered for a project through the web
+API. Registration stores an immutable source artifact; the FastAPI process does
+not import or execute it. A separately operated `python -m veritybench.worker`
+claims those queued runs and invokes the Docker sandbox. If that worker is not
+running, the run remains queued and never falls back to FastAPI execution. The
+sandbox mounts only the agent file, disables networking, drops capabilities,
+runs as a non-root UID, and applies read-only, CPU, memory, and process limits.
 ZIP uploads, GitHub imports, arbitrary HTTP agents, external URLs, and real
 payment systems remain unsupported.
 
 ## Quick start
 
-Requirements: Python 3.12.8, Node.js 22.14.0, and npm. The pinned versions are
-recorded in `.python-version` and `frontend/.nvmrc`.
+Requirements: Python 3.12.8, Node.js 22.14.0, npm, and Docker for custom
+`--agent-path` or remote-worker runs. The pinned versions are recorded in `.python-version` and
+`frontend/.nvmrc`.
 
 ```bash
 python3.12 -m venv .venv
@@ -64,6 +70,17 @@ python -m uvicorn veritybench.api.main:app --reload --port 8000
 cd frontend && npm run dev
 ```
 
+For explicitly registered remote agents, run the isolated worker separately on
+a host with Docker access and the same database/artifact storage:
+
+```bash
+VERITYBENCH_AGENT_IMAGE='registry.example/veritybench-agent@sha256:<digest>' \
+python -m veritybench.worker
+```
+
+The worker is intentionally not started by FastAPI and the API container must
+not receive the Docker socket.
+
 The initial migration safely baselines an existing complete local SQLite schema;
 it does not delete data from databases created by earlier builds.
 
@@ -91,6 +108,7 @@ The CLI operates locally and does not require login for local evaluation:
 ```bash
 veritybench init                         # create veritybench.toml and runs/
 veritybench validate                     # check the local configuration
+veritybench agent init ./my-agent.py      # create a compatible starter
 veritybench test --scenario normal --agent safe
 veritybench test --scenario all --agent safe
 veritybench test --scenario timeout_after_success \
@@ -107,7 +125,10 @@ veritybench export runs/latest.json --output report.json
 that is expected for the defective timeout example. A local worker timeout
 returns 124, while an invalid contract or worker refusal returns 2. `--json`
 prints only the report JSON on stdout; a normal local-agent run prints live
-engine events before its summary. `veritybench demo` is the exception: it
+engine events before its summary. Custom agents require a responsive Docker
+daemon and a local image referenced by `VERITYBENCH_AGENT_IMAGE` as
+`name@sha256:<64 lowercase hex characters>`; Docker is never silently skipped.
+`veritybench demo` is the exception: it
 writes both the expected failing defective report and the passing safe report,
 then exits successfully. See the [development guide](docs/DEVELOPMENT.md) and
 [Python agent contract](docs/AGENT_CONTRACT.md) for every option.

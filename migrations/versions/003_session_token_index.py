@@ -4,8 +4,8 @@ Revision ID: 003_session_token_index
 Revises: 002_run_events
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "003_session_token_index"
 down_revision = "002_run_events"

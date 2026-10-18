@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
 import { AgentsPage } from './components/AgentsPage'
 import { Icon, type IconName } from './components/Icon'
@@ -16,7 +16,7 @@ import {
   type SupportedAgent,
   type SupportedScenario,
 } from './lib/api'
-import type { CoverageItem, EvaluatorResult, Run, TrendPoint, View } from './types'
+import type { CoverageItem, EvaluatorResult, Run, RunStatus, TrendPoint, View } from './types'
 
 type Session = { token: string; user: ApiUser }
 type Theme = 'light' | 'dark'
@@ -75,6 +75,13 @@ const scenarios: Array<{ value: SupportedScenario; label: string; description: s
   { value: 'unrecoverable_failure', label: 'Unrecoverable failure', description: 'Every payment attempt remains unsuccessful.' },
 ]
 
+const localRunAgents: ApiAgent[] = [
+  { key: 'safe', name: 'safe-sample-agent', description: 'Reconciles uncertainty safely.', source: 'repository', runnable: true, supported_scenarios: scenarios.map((scenario) => scenario.value) },
+  { key: 'defective', name: 'defective-sample-agent', description: 'Demonstrates a duplicate-payment defect.', source: 'repository', runnable: true, supported_scenarios: scenarios.map((scenario) => scenario.value) },
+]
+
+const AgentCatalogContext = createContext<ApiAgent[]>(localRunAgents)
+
 const scenarioLabels: Record<SupportedScenario, string> = Object.fromEntries(
   scenarios.map((scenario) => [scenario.value, scenario.label]),
 ) as Record<SupportedScenario, string>
@@ -117,7 +124,7 @@ function readStoredSession(): Session | null {
 function readStoredTheme(): Theme {
   const stored = readStorage<Theme | null>(themeStorageKey, null)
   if (stored === 'light' || stored === 'dark') return stored
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  return 'dark'
 }
 
 function readStoredDatasets(): LocalDataset[] {
@@ -171,6 +178,51 @@ function formatScore(value: number | null) {
   return value === null ? '—' : `${value}%`
 }
 
+const backendRunStates = new Set<RunStatus>([
+  'queued',
+  'running',
+  'cancel_requested',
+  'passed',
+  'failed',
+  'timed_out',
+  'inconclusive',
+  'cancelled',
+])
+
+function normalizeRunState(state: string): RunStatus {
+  return backendRunStates.has(state as RunStatus) ? state as RunStatus : 'inconclusive'
+}
+
+function displayRunState(run: ApiRun): RunStatus {
+  const state = normalizeRunState(run.state)
+  return run.cancel_requested && (state === 'queued' || state === 'running') ? 'cancel_requested' : state
+}
+
+function humanizeState(state: RunStatus) {
+  if (state === 'needs-review') return 'Needs review'
+  if (state === 'completed' || state === 'passed') return 'Passed'
+  const label = state.replaceAll('_', ' ')
+  return label.charAt(0).toUpperCase() + label.slice(1)
+}
+
+function durationBetween(start: string | null, end: string | null) {
+  if (!start || !end) return null
+  const startMs = Date.parse(start)
+  const endMs = Date.parse(end)
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return null
+  const milliseconds = endMs - startMs
+  if (milliseconds < 1000) return `${milliseconds} ms`
+  if (milliseconds < 60_000) return `${(milliseconds / 1000).toFixed(1)} s`
+  return `${Math.floor(milliseconds / 60_000)}m ${Math.round((milliseconds % 60_000) / 1000)}s`
+}
+
+function apiRunDuration(run: ApiRun) {
+  const duration = durationBetween(run.started_at, run.completed_at)
+  if (duration) return duration
+  if (run.started_at) return 'In progress'
+  return run.report ? `${run.report.trace.length} trace events` : 'Timing unavailable'
+}
+
 function runScore(report: ApiReport | null) {
   if (!report) return null
   const invariants = report.evaluation.invariants
@@ -187,11 +239,11 @@ function apiRunToView(run: ApiRun): Run {
     model: report?.agent_name ?? `${run.agent}-sample-agent`,
     modelVersion: report ? 'Persisted report' : 'Report unavailable',
     dataset: formatScenario(run.scenario),
-    status: run.state === 'passed' ? 'completed' : run.state === 'failed' ? 'needs-review' : 'running',
+    status: displayRunState(run),
     score: runScore(report),
     scoreDelta: null,
     completedAt: formatDate(run.completed_at ?? run.created_at),
-    duration: report ? `${report.trace.length} trace events` : 'Report unavailable',
+    duration: apiRunDuration(run),
     cases: invariants.length,
     passedCases: invariants.filter((invariant) => invariant.passed).length,
     caseLabel: 'invariants',
@@ -260,9 +312,17 @@ function pageForPath(pathname: string): View {
   return 'overview'
 }
 
+function runIdFromPath(pathname: string) {
+  if (!pathname.startsWith('/runs/')) return null
+  try {
+    return decodeURIComponent(pathname.slice('/runs/'.length)) || null
+  } catch {
+    return null
+  }
+}
+
 function StatusBadge({ status }: { status: Run['status'] }) {
-  const labels: Record<Run['status'], string> = { completed: 'Passed', running: 'Running', 'needs-review': 'Needs review' }
-  return <span className={`status-badge status-${status}`}><span className="status-dot" />{labels[status]}</span>
+  return <span className={`status-badge status-${status}`}><span className="status-dot" />{humanizeState(status)}</span>
 }
 
 function SourceBadge({ apiMode, apiStatus }: { apiMode: boolean; apiStatus: ApiStatus }) {
@@ -283,7 +343,7 @@ function Workspace() {
   const location = useLocation()
   const navigate = useNavigate()
   const view = pageForPath(location.pathname)
-  const selectedRunId = location.pathname.startsWith('/runs/') ? decodeURIComponent(location.pathname.slice('/runs/'.length)) : null
+  const selectedRunId = runIdFromPath(location.pathname)
   const [theme, setTheme] = useState<Theme>(() => readStoredTheme())
   const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
   const [authOpen, setAuthOpen] = useState(false)
@@ -295,6 +355,7 @@ function Workspace() {
   const [apiAgents, setApiAgents] = useState<ApiAgent[]>([])
   const [agentsLoading, setAgentsLoading] = useState(false)
   const [agentsError, setAgentsError] = useState('')
+  const [agentRegistrationBusy, setAgentRegistrationBusy] = useState(false)
   const [apiRuns, setApiRuns] = useState<ApiRun[]>([])
   const [runsLoading, setRunsLoading] = useState(false)
   const [runError, setRunError] = useState('')
@@ -310,8 +371,8 @@ function Workspace() {
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
   const apiMode = apiStatus === 'online' && Boolean(token && selectedProjectId)
   const displayRuns = apiMode ? apiRuns.map(apiRunToView) : demoRuns
-  const selectedApiRun = apiRuns.find((run) => run.id === selectedRunId) ?? null
-  const selectedRun = apiMode ? (selectedApiRun ? apiRunToView(selectedApiRun) : null) : demoRuns.find((run) => run.id === selectedRunId) ?? demoRuns[0]
+  const selectedApiRun = apiRuns.find((run) => run.id === selectedRunId && run.project_id === selectedProjectId) ?? null
+  const selectedRun = apiMode ? (selectedApiRun ? apiRunToView(selectedApiRun) : null) : selectedRunId ? demoRuns.find((run) => run.id === selectedRunId) ?? null : null
   const stats = useMemo(() => apiMode ? buildApiStats(apiRuns) : buildFixtureStats(), [apiMode, apiRuns])
   const coverage = apiMode ? buildApiCoverage(apiRuns) : demoCoverage
   const trend = apiMode ? buildTrend(apiRuns.map(apiRunToView)) : buildTrend(demoRuns)
@@ -432,6 +493,8 @@ function Workspace() {
   }
 
   const selectProject = (projectId: string) => {
+    setApiRuns([])
+    setRunError('')
     setSelectedProjectId(projectId || null)
     saveStoredProject(projectId || null)
     setRunComposerOpen(false)
@@ -474,6 +537,17 @@ function Workspace() {
       setRunComposerError(error instanceof Error ? error.message : 'The API could not persist this run.')
     } finally {
       setRunBusy(false)
+    }
+  }
+
+  const registerAgent = async (name: string, version: string, source: string) => {
+    if (!token || !selectedProjectId) throw new Error('Sign in and select a project before registering an agent.')
+    setAgentRegistrationBusy(true)
+    try {
+      const registered = await api.registerAgent(token, selectedProjectId, name, version, source)
+      setApiAgents((current) => [registered, ...current])
+    } finally {
+      setAgentRegistrationBusy(false)
     }
   }
 
@@ -530,19 +604,21 @@ function Workspace() {
           </div>
         </header>
 
+        <AgentCatalogContext.Provider value={apiMode ? apiAgents : localRunAgents}>
         <main className="page-content">
           <ProjectBar apiStatus={apiStatus} error={projectError} loading={projectsLoading} onCreate={createProject} onOpenAuth={() => setAuthOpen(true)} onSelect={selectProject} projects={projects} selectedProjectId={selectedProjectId} session={session} />
           {noticeVisible && localSettings.showFixtureHints && <div className={`data-notice ${apiMode ? 'data-notice-live' : ''}`}><Icon name={apiMode ? 'shield' : 'layers'} size={16} /><span><strong>{apiMode ? 'Live project data' : apiStatus === 'offline' ? 'API unavailable · offline fallback' : 'Local fixture mode'}</strong>{' · '}{apiMode ? 'Runs, metrics, reports, and evidence are loaded from the selected project.' : 'Read-only fixtures are labeled throughout; no local action writes to the API.'}</span><button aria-label="Dismiss data source notice" className="notice-dismiss" onClick={() => setNoticeVisible(false)} type="button">×</button></div>}
           {runError && apiMode && <div className="inline-error" role="alert">{runError}</div>}
           {view === 'overview' && <Overview apiData={apiMode} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} runs={displayRuns} stats={stats} trend={trend} />}
-          {view === 'dashboard' && <Dashboard apiData={apiMode} apiRuns={apiRuns} composerOpen={runComposerOpen} compactRows={localSettings.compactRows} onCancelRun={() => setRunComposerOpen(false)} onOpenRun={openRun} onRun={requestRun} onSubmitRun={submitRun} runBusy={runBusy} runComposerError={runComposerError} runs={displayRuns} stats={stats} trend={trend} />}
+          {view === 'dashboard' && <Dashboard agents={apiMode ? apiAgents : localRunAgents} apiData={apiMode} apiRuns={apiRuns} composerOpen={runComposerOpen} compactRows={localSettings.compactRows} onCancelRun={() => setRunComposerOpen(false)} onOpenRun={openRun} onRun={requestRun} onSubmitRun={submitRun} runBusy={runBusy} runComposerError={runComposerError} runs={displayRuns} stats={stats} trend={trend} />}
            {view === 'run' && <RunDetail api={api} apiRun={apiMode ? selectedApiRun : null} loading={apiMode && runsLoading && !selectedApiRun} onBack={() => setView('dashboard')} onRunUpdated={(nextRun) => setApiRuns((current) => [nextRun, ...current.filter((run) => run.id !== nextRun.id)])} run={selectedRun} token={token} />}
-           {view === 'agents' && <AgentsPage agents={apiAgents} apiData={apiMode} error={agentsError} loading={agentsLoading} onBrowseRuns={() => setView('dashboard')} onOpenCli={() => setView('cli')} onRetry={() => { if (token && selectedProjectId) { setAgentsLoading(true); api.listAgents(token, selectedProjectId).then(setApiAgents).catch((error: unknown) => setAgentsError(error instanceof Error ? error.message : 'Could not load project agents.')).finally(() => setAgentsLoading(false)) } }} />}
+           {view === 'agents' && <AgentsPage agents={apiAgents} apiData={apiMode} error={agentsError} loading={agentsLoading} onBrowseRuns={() => setView('dashboard')} onOpenCli={() => setView('cli')} onRegister={registerAgent} registrationBusy={agentRegistrationBusy} onRetry={() => { if (token && selectedProjectId) { setAgentsLoading(true); api.listAgents(token, selectedProjectId).then(setApiAgents).catch((error: unknown) => setAgentsError(error instanceof Error ? error.message : 'Could not load project agents.')).finally(() => setAgentsLoading(false)) } }} />}
           {view === 'datasets' && <DatasetsPage datasets={localDatasets} onAdd={(dataset) => setLocalDatasets((current) => [...current, dataset])} onSelect={setView} />}
           {view === 'evaluators' && <EvaluatorsPage enabled={enabledEvaluators} onToggle={(id) => setEnabledEvaluators((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />}
           {view === 'settings' && <SettingsPage apiStatus={apiStatus} enabledEvaluators={enabledEvaluators.length} localSettings={localSettings} onCheck={() => { setApiStatus('checking'); api.getHealth().then(() => setApiStatus('online')).catch(() => setApiStatus('offline')) }} onReset={resetLocalConfig} onSettingsChange={updateLocalSettings} onThemeChange={setTheme} session={session} theme={theme} />}
           {view === 'cli' && <CliGuide />}
         </main>
+        </AgentCatalogContext.Provider>
       </div>
       {authOpen && <AuthPanel api={api} onClose={() => setAuthOpen(false)} onSignedIn={setSignedIn} />}
     </div>
@@ -619,7 +695,8 @@ function RecentRuns({ apiData, onOpenRun, runs }: { apiData: boolean; onOpenRun:
 }
 
 function RunRow({ onOpen, run }: { onOpen: (id: string) => void; run: Run }) {
-  return <button className={`run-row ${run.status === 'needs-review' ? 'run-row-needs-review' : ''}`} onClick={() => onOpen(run.id)} type="button"><span className="run-type-icon"><Icon name={run.status === 'needs-review' ? 'warning' : 'activity'} size={16} /></span><span className="run-row-copy"><strong>{run.name}</strong><span>{run.id} · {run.dataset}</span></span><span className="run-row-score"><strong>{formatScore(run.score)}</strong><span>{run.score === null ? 'no report' : `${run.passedCases}/${run.cases} ${run.caseLabel ?? 'cases'}`}</span></span><Icon name="chevron-right" size={16} className="row-chevron" /></button>
+  const attention = run.status === 'needs-review' || run.status === 'failed' || run.status === 'timed_out' || run.status === 'inconclusive' || run.status === 'cancelled'
+  return <button className={`run-row ${attention ? 'run-row-needs-review' : ''}`} onClick={() => onOpen(run.id)} type="button"><span className="run-type-icon"><Icon name={attention ? 'warning' : 'activity'} size={16} /></span><span className="run-row-copy"><strong>{run.name}</strong><span>{run.id} · {run.dataset}</span></span><span className="run-row-score"><strong>{formatScore(run.score)}</strong><span>{run.score === null ? 'no report' : `${run.passedCases}/${run.cases} ${run.caseLabel ?? 'cases'}`}</span></span><Icon name="chevron-right" size={16} className="row-chevron" /></button>
 }
 
 function CoveragePanel({ apiData, items }: { apiData: boolean; items: CoverageItem[] }) {
@@ -630,7 +707,7 @@ function CoverageBar({ item }: { item: CoverageItem }) {
   return <div className="coverage-row"><div className="coverage-label"><span>{item.label}</span><strong>{item.value}%</strong></div><div aria-label={`${item.label}: ${item.value} percent`} aria-valuemax={100} aria-valuemin={0} aria-valuenow={item.value} className="progress-track" role="progressbar"><span className={`progress-fill fill-${item.color}`} style={{ width: `${item.value}%` }} /></div></div>
 }
 
-function Dashboard({ apiData, apiRuns, composerOpen, compactRows, onCancelRun, onOpenRun, onRun, onSubmitRun, runBusy, runComposerError, runs, stats, trend }: { apiData: boolean; apiRuns: ApiRun[]; composerOpen: boolean; compactRows: boolean; onCancelRun: () => void; onOpenRun: (id: string) => void; onRun: () => void; onSubmitRun: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void>; runBusy: boolean; runComposerError: string; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
+function Dashboard({ agents, apiData, apiRuns, composerOpen, compactRows, onCancelRun, onOpenRun, onRun, onSubmitRun, runBusy, runComposerError, runs, stats, trend }: { agents: ApiAgent[]; apiData: boolean; apiRuns: ApiRun[]; composerOpen: boolean; compactRows: boolean; onCancelRun: () => void; onOpenRun: (id: string) => void; onRun: () => void; onSubmitRun: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void>; runBusy: boolean; runComposerError: string; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
   const [filter, setFilter] = useState<'all' | Run['status']>('all')
   const [query, setQuery] = useState('')
   const filteredRuns = runs.filter((run) => (filter === 'all' || run.status === filter) && `${run.name} ${run.dataset} ${run.id}`.toLowerCase().includes(query.toLowerCase()))
@@ -638,6 +715,25 @@ function Dashboard({ apiData, apiRuns, composerOpen, compactRows, onCancelRun, o
 }
 
 function RunComposer({ busy, error, onCancel, onSubmit }: { busy: boolean; error: string; onCancel: () => void; onSubmit: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void> }) {
+  const agents = useContext(AgentCatalogContext)
+  const [agent, setAgent] = useState<SupportedAgent>(agents.find((item) => item.runnable)?.key ?? 'safe')
+  const [scenario, setScenario] = useState<SupportedScenario>('normal')
+  const selectedAgent = agents.find((item) => item.key === agent)
+  const availableScenarios = scenarios.filter((item) => selectedAgent?.supported_scenarios.includes(item.value) ?? true)
+  const selectedScenario = availableScenarios.find((item) => item.value === scenario) ?? availableScenarios[0]
+  useEffect(() => {
+    if (!agents.some((item) => item.key === agent && item.runnable)) {
+      setAgent(agents.find((item) => item.runnable)?.key ?? 'safe')
+    }
+  }, [agent, agents])
+  useEffect(() => {
+    if (selectedScenario && scenario !== selectedScenario.value) setScenario(selectedScenario.value)
+  }, [scenario, selectedScenario])
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void onSubmit(agent, scenario) }
+  return <section className="panel run-composer"><div className="panel-heading"><div><span className="section-kicker">Protected evaluation execution</span><h2>Configure a persisted run</h2></div><button aria-label="Close run controls" className="icon-button subtle-icon" onClick={onCancel} type="button">×</button></div><p className="composer-description">Select an enabled registered agent and a scenario. Remote agents require the separately configured isolated worker; the API never imports their source.</p><form className="composer-form" onSubmit={submit}><label>Agent<select onChange={(event) => setAgent(event.target.value)} value={agent}>{agents.filter((item) => item.runnable).map((item) => <option key={item.key} value={item.key}>{item.name}{item.version ? ` v${item.version}` : ''} · {item.source}</option>)}</select></label><label>Scenario<select onChange={(event) => setScenario(event.target.value as SupportedScenario)} value={scenario}>{availableScenarios.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><span className="field-help">{selectedScenario?.description}</span></label><div className="composer-actions"><button className="button button-primary" disabled={busy || !selectedAgent?.runnable} type="submit"><Icon name="play" size={14} /> {busy ? 'Running…' : 'Run and persist report'}</button><button className="button button-quiet" onClick={onCancel} type="button">Cancel</button></div></form>{error && <p className="auth-error" role="alert">{error}</p>}</section>
+}
+
+function LegacyRunComposer({ busy, error, onCancel, onSubmit }: { busy: boolean; error: string; onCancel: () => void; onSubmit: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void> }) {
   const [agent, setAgent] = useState<SupportedAgent>('safe')
   const [scenario, setScenario] = useState<SupportedScenario>('normal')
   const selectedScenario = scenarios.find((item) => item.value === scenario)
@@ -662,7 +758,28 @@ function AgentComparison({ apiData, runs }: { apiData: boolean; runs: ApiRun[] }
     const scores = modelRuns.map((run) => run.score).filter((score): score is number => score !== null)
     return { name, score: scores.length ? Math.round(scores.reduce((total, score) => total + score, 0) / scores.length) : null, count: modelRuns.length, color: name.includes('defective') ? 'amber' : 'accent' }
   })
-  return <section className="panel comparison-panel"><div className="panel-heading"><div><span className="section-kicker">Agent comparison</span><h2>{apiData ? 'By persisted report' : 'By fixture run'}</h2></div><span className="muted-label">Average score</span></div><div className="comparison-list">{models.length ? models.map((model) => <div className="comparison-row" key={model.name}><span className={`model-bullet bullet-${model.color}`} /><span className="model-name"><strong>{model.name}</strong><small>{model.count} {model.count === 1 ? 'run' : 'runs'}</small></span><span className="model-score"><strong>{formatScore(model.score)}</strong><span className="mini-track"><span className={`mini-fill fill-${model.color}`} style={{ width: `${model.score ?? 0}%` }} /></span></span></div>) : <EmptyPanel description="No persisted reports to compare." />}</div><p className="panel-footnote">{apiData ? 'Averages are calculated from report evaluation invariants.' : 'Fixture comparison is read-only and not a backend claim.'}</p></section>
+  return <>
+    <section className="panel comparison-panel"><div className="panel-heading"><div><span className="section-kicker">Agent comparison</span><h2>{apiData ? 'By persisted report' : 'By fixture run'}</h2></div><span className="muted-label">Average score</span></div><div className="comparison-list">{models.length ? models.map((model) => <div className="comparison-row" key={model.name}><span className={`model-bullet bullet-${model.color}`} /><span className="model-name"><strong>{model.name}</strong><small>{model.count} {model.count === 1 ? 'run' : 'runs'}</small></span><span className="model-score"><strong>{formatScore(model.score)}</strong><span className="mini-track"><span className={`mini-fill fill-${model.color}`} style={{ width: `${model.score ?? 0}%` }} /></span></span></div>) : <EmptyPanel description="No persisted reports to compare." />}</div><p className="panel-footnote">{apiData ? 'Averages are calculated from report evaluation invariants.' : 'Fixture comparison is read-only and not a backend claim.'}</p></section>
+    <RunComparison apiData={apiData} runs={sourceRuns} />
+  </>
+}
+
+function RunComparison({ apiData, runs }: { apiData: boolean; runs: Run[] }) {
+  const [leftId, setLeftId] = useState(runs[0]?.id ?? '')
+  const [rightId, setRightId] = useState(runs[1]?.id ?? runs[0]?.id ?? '')
+  const left = runs.find((run) => run.id === leftId) ?? null
+  const right = runs.find((run) => run.id === rightId) ?? null
+
+  useEffect(() => {
+    if (!runs.some((run) => run.id === leftId)) setLeftId(runs[0]?.id ?? '')
+    if (!runs.some((run) => run.id === rightId)) setRightId(runs[1]?.id ?? runs[0]?.id ?? '')
+  }, [leftId, rightId, runs])
+
+  return <section className="panel run-comparison-panel"><div className="panel-heading"><div><span className="section-kicker">Compare loaded runs</span><h2>Side-by-side signal</h2></div><span className="muted-label">{apiData ? 'Selected project data' : 'Fixture data'}</span></div><p className="comparison-help">Choose two runs already loaded in this workspace. Scores and timing stay blank when the source did not provide them.</p><div className="comparison-selectors"><label>Run A<select onChange={(event) => setLeftId(event.target.value)} value={leftId}><option value="">Select a run</option>{runs.map((run) => <option key={run.id} value={run.id}>{run.name} · {run.id}</option>)}</select></label><span className="comparison-vs">vs</span><label>Run B<select onChange={(event) => setRightId(event.target.value)} value={rightId}><option value="">Select a run</option>{runs.map((run) => <option key={run.id} value={run.id}>{run.name} · {run.id}</option>)}</select></label></div>{left && right ? <div className="comparison-facts"><ComparisonFact label="Status" left={humanizeState(left.status)} right={humanizeState(right.status)} /><ComparisonFact label="Score" left={formatScore(left.score)} right={formatScore(right.score)} /><ComparisonFact label="Timing" left={left.duration} right={right.duration} /><ComparisonFact label="Evidence" left={`${left.passedCases}/${left.cases} ${left.caseLabel ?? 'cases'}`} right={`${right.passedCases}/${right.cases} ${right.caseLabel ?? 'cases'}`} /></div> : <EmptyPanel description="Select two runs to compare their observed results." />}</section>
+}
+
+function ComparisonFact({ label, left, right }: { label: string; left: string; right: string }) {
+  return <div className="comparison-fact"><span>{label}</span><strong>{left}</strong><strong>{right}</strong></div>
 }
 
 function RunDetail({ api, apiRun, loading, onBack, onRunUpdated, run, token }: { api: ApiClient; apiRun: ApiRun | null; loading: boolean; onBack: () => void; onRunUpdated: (run: ApiRun) => void; run: Run | null; token: string | null }) {

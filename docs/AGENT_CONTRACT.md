@@ -1,11 +1,15 @@
 # Local Python agent contract
 
-VerityBench supports custom Python agents for **CLI-local evaluation only**.
-The API and FastAPI process do not import custom modules. The CLI starts a
-separate worker process, passes it a deterministic simulation configuration,
-and receives versioned JSON events and one report. This process boundary keeps
-arbitrary agent code out of the API process, but it is not a hostile-code
-sandbox: use only trusted local code.
+VerityBench supports custom Python agents in two explicitly selected modes:
+
+- CLI-local evaluation keeps source code on the developer's machine.
+- Remote evaluation stores a project-owned source artifact and requires the
+  separate `python -m veritybench.worker` process.
+
+The API and FastAPI process do not import custom modules. Both execution modes
+require a responsive Docker daemon and a locally available digest-pinned image
+in `VERITYBENCH_AGENT_IMAGE`; neither falls back to importing the agent on the
+host. The remote API only queues a run until the isolated worker claims it.
 
 ## Version 1
 
@@ -43,8 +47,15 @@ The complete safe example is at
 
 ```bash
 veritybench init
+export VERITYBENCH_AGENT_IMAGE='registry.example/veritybench-agent@sha256:<64-lowercase-hex-digest>'
 veritybench test --agent-path examples/agents/template_agent.py
 ```
+
+The image must already be present locally because the runner always uses
+`--pull=never`. It must contain Python and the installed `veritybench` and
+`veritybench_engine` packages. The repository `Dockerfile` is a compatible
+starting point for building an image; configure the resulting immutable image
+reference, rather than a mutable tag such as `:latest`.
 
 ## Engine compatibility
 
@@ -70,21 +81,55 @@ being imported in the FastAPI process.
 
 ## Worker behavior and limits
 
-- The worker runs with a sanitized environment and does not receive the
-  parent process environment, API session, database URL, or API secrets.
+- Docker is preflighted before staging or executing an agent: the Docker
+  executable, daemon, and exact configured image must all be available. Missing
+  Docker, an unavailable daemon, a missing image, or an unpinned image fails
+  clearly with no host fallback.
+- The requested source must be a regular, non-symlink `.py` file without
+  parent-directory traversal. VerityBench copies only that file into a private
+  temporary directory. No adjacent files, directories, host working directory,
+  Docker socket, or other host mounts are made available to the container.
+- The container runs with `--network=none`, `--read-only`,
+  `--cap-drop=ALL`, `--security-opt=no-new-privileges:true`, a non-root UID,
+  `--pids-limit=128`, `--memory=256m`, `--cpus=1`, and `--pull=never`.
+  The runtime receives a fixed minimal environment rather than the parent
+  process environment, API session, database URL, or API secrets.
+
 - Agent stdout/stderr is captured and counted, not mixed into the worker JSON
   protocol. Worker protocol output is capped at 256 KiB; diagnostics are
   capped at 16 KiB.
 - The default wall-clock timeout is 10 seconds. Change it with `--timeout`
-  when testing a trusted local agent.
+  when testing a local agent. A timeout kills the Docker client process and
+  attempts a forced container removal; the invocation also uses `--rm`.
 - Engine events are streamed as structured JSON messages internally and shown
   live by the CLI. `--json` suppresses live display so stdout remains one
   valid report JSON document.
 - A timeout exits with code 124. Invalid paths, unsupported contract versions,
-  invalid decisions, import/factory failures, and worker protocol refusals exit
-  with code 2. An evaluation that completes but fails independent checks exits
-  with code 1.
+  invalid decisions, import/factory failures, worker protocol refusals, and
+  Docker/image preflight failures exit with code 2. An evaluation that
+  completes but fails independent checks exits with code 1.
 
-The worker does not grant network access or filesystem isolation. Treat the
-agent module and files beside it as trusted local code, and keep credentials
-out of that directory.
+## Remote registration and worker
+
+An authenticated project can register a single Python source module through
+`POST /api/v1/projects/{project_id}/agents` with `name`, `version`, and
+`source`. The API stores the bytes under the configured artifact directory and
+records a SHA-256 digest. It never imports, compiles, installs, or executes the
+submitted source. A run refers to that immutable registration using
+`agent: remote:<registration-id>`.
+
+Run `python -m veritybench.worker` separately on a host that can read the same
+artifact directory and database and that has the pinned Docker image. The
+worker marks the run queued/running/terminal and persists the same event journal
+used by the web UI. If the worker or Docker image is unavailable, the run is
+reported as unavailable or remains queued; it is never executed in FastAPI.
+
+## Boundary and remaining limitation
+
+The current CLI and remote worker use a decision-only protocol: the sandbox
+returns validated `AgentDecision` messages, while the trusted parent process
+owns `DeterministicEngine`, the ledger, metrics, and independent evaluator. A
+sandbox cannot submit a replacement report as the authoritative result. This is
+still not a formal defense against a Docker/container escape; use a trusted,
+pinned runtime or a stronger isolation backend such as gVisor, Kata, or a
+microVM for hostile code.

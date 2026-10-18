@@ -1,9 +1,11 @@
-"""Bounded subprocess boundary for CLI-local Python agents.
+"""Docker-worker boundary for CLI-local Python agents.
 
-The parent-side ``run_local_agent`` function starts this module in a fresh
-process.  The child imports the user module, runs the existing deterministic
-engine, and writes only versioned JSON lines to stdout.  Agent stdout/stderr is
-redirected and counted rather than mixed into the protocol.
+The legacy report worker remains available for compatibility tests, while
+production CLI/remote execution uses ``run_sandboxed_agent`` and the
+decision-only protocol. In that mode the child imports only the staged user
+module and returns validated decisions; the trusted parent owns the engine,
+ledger, evaluator, and final report. Agent stdout/stderr is redirected and
+counted rather than mixed into the protocol.
 """
 
 from __future__ import annotations
@@ -20,14 +22,17 @@ import subprocess  # nosec B404 - starts only the fixed VerityBench worker modul
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
 from veritybench_engine import (
     Agent,
+    AgentContext,
+    AgentDecision,
     DeterministicEngine,
+    ExecutionEvent,
     FaultScenario,
     SimulationConfig,
 )
@@ -36,6 +41,15 @@ from .agent_contract import (
     AGENT_CONTRACT_VERSION,
     AgentContractError,
     create_agent_from_module,
+    validate_agent,
+)
+from .agent_protocol import context_from_dict, context_to_dict, decision_from_dict, decision_to_dict
+from .sandbox import (
+    AGENT_CONTAINER_PATH,
+    DockerSandbox,
+    SandboxError,
+    stage_agent,
+    validate_agent_source,
 )
 
 WORKER_PROTOCOL_VERSION = 1
@@ -43,7 +57,6 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_WORKER_OUTPUT_BYTES = 256 * 1024
 MAX_WORKER_DIAGNOSTIC_BYTES = 16 * 1024
 MAX_PROTOCOL_LINE_BYTES = 64 * 1024
-_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 
 class LocalWorkerError(RuntimeError):
@@ -94,19 +107,6 @@ class _BoundedTextStream(io.StringIO):
 
     def flush(self) -> None:
         return None
-
-
-def _worker_environment() -> dict[str, str]:
-    """Return a minimal environment; parent API credentials are not inherited."""
-
-    return {
-        "PATH": os.defpath,
-        "PYTHONPATH": str(_SOURCE_ROOT),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONUNBUFFERED": "1",
-        "LC_ALL": "C",
-        "LANG": "C",
-    }
 
 
 def _simulation_config_to_dict(config: SimulationConfig) -> dict[str, object]:
@@ -243,14 +243,83 @@ def _worker_main() -> int:
     return 0
 
 
+def _decision_worker_main() -> int:
+    """Serve validated decisions without owning the engine or evaluator."""
+
+    stdout = _BoundedTextStream(MAX_WORKER_DIAGNOSTIC_BYTES)
+    stderr = _BoundedTextStream(MAX_WORKER_DIAGNOSTIC_BYTES)
+    try:
+        first_line = sys.stdin.readline()
+        if not first_line:
+            raise LocalWorkerError("invalid_request", "decision worker did not receive an init message")
+        request = json.loads(first_line)
+        if not isinstance(request, dict):
+            raise LocalWorkerError("invalid_request", "decision worker init must be an object")
+        if request.get("protocol_version") != WORKER_PROTOCOL_VERSION:
+            raise LocalWorkerError("unsupported_protocol", "unsupported decision protocol version")
+        if request.get("type") != "init":
+            raise LocalWorkerError("invalid_request", "decision worker must start with init")
+        if request.get("agent_contract_version") != AGENT_CONTRACT_VERSION:
+            raise AgentContractError(
+                "unsupported_contract",
+                f"module must declare AGENT_CONTRACT_VERSION = {AGENT_CONTRACT_VERSION}",
+            )
+        agent_path_value = request.get("agent_path")
+        if not isinstance(agent_path_value, str) or not agent_path_value:
+            raise LocalWorkerError("invalid_request", "decision worker agent_path must be text")
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            agent = _load_agent(Path(agent_path_value))
+        _emit_worker_message("ready", {"name": agent.name})
+
+        expected_sequence = 0
+        for line in sys.stdin:
+            payload = _parse_protocol_line(line.rstrip("\r\n"))
+            if payload.get("type") != "decide":
+                raise LocalWorkerError("worker_protocol_error", "decision worker expected a decide message")
+            sequence = payload.get("sequence")
+            if sequence != expected_sequence:
+                raise LocalWorkerError("worker_protocol_error", "decision sequence is out of order")
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                context = context_from_dict(payload.get("context"))
+                decision = agent.decide(context)
+            _emit_worker_message(
+                "decision",
+                {"sequence": expected_sequence, "decision": decision_to_dict(decision)},
+            )
+            expected_sequence += 1
+    except AgentContractError as exc:
+        _emit_worker_message(
+            "error",
+            {"error": {"code": exc.code, "message": exc.message}, "diagnostics": _diagnostics(stdout, stderr)},
+        )
+        return 1
+    except LocalWorkerError as exc:
+        _emit_worker_message(
+            "error",
+            {"error": {"code": exc.code, "message": exc.message}, "diagnostics": _diagnostics(stdout, stderr)},
+        )
+        return 1
+    except Exception as exc:
+        _emit_worker_message(
+            "error",
+            {
+                "error": {"code": "worker_exception", "message": f"{type(exc).__name__}: {exc}"},
+                "diagnostics": _diagnostics(stdout, stderr),
+            },
+        )
+        return 1
+    return 0
+
+
 def _read_stream(
     stream: BinaryIO,
     capture: _CapturedStream,
     lines: queue.Queue[str] | None = None,
 ) -> None:
     pending = bytearray()
+    read_chunk = getattr(stream, "read1", stream.read)
     while True:
-        chunk = stream.read(4096)
+        chunk = read_chunk(4096)
         if not chunk:
             break
         if not isinstance(chunk, bytes):
@@ -312,133 +381,294 @@ def run_local_agent(
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     on_event: Callable[[dict[str, object]], None] | None = None,
+    runtime_command: Sequence[str] | None = None,
 ) -> dict[str, object]:
-    """Run one contract agent outside the CLI/API process and return its report."""
+    """Run one contract agent in the configured Docker sandbox and return its report."""
 
     if timeout_seconds <= 0:
         raise LocalWorkerError("invalid_timeout", "timeout must be greater than zero seconds")
     try:
-        resolved_path = agent_path.expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise LocalWorkerError("agent_not_found", f"cannot resolve agent path: {exc}") from exc
-    if not resolved_path.is_file() or resolved_path.suffix.lower() != ".py":
-        raise LocalWorkerError("invalid_agent_path", "agent path must point to an existing .py file")
+        validate_agent_source(agent_path)
+        sandbox = DockerSandbox.from_environment(runtime_command)
+        sandbox.preflight()
+    except AgentContractError as exc:
+        raise LocalWorkerError(exc.code, exc.message) from exc
+    except SandboxError as exc:
+        raise LocalWorkerError(exc.code, exc.message) from exc
 
-    request = {
-        "protocol_version": WORKER_PROTOCOL_VERSION,
-        "agent_contract_version": AGENT_CONTRACT_VERSION,
-        "agent_path": str(resolved_path),
-        "simulation": _simulation_config_to_dict(config),
-    }
+    container_name = sandbox.container_name()
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(  # nosec B603 - executable/module are fixed; agent path is protocol data  # noqa: S603
-            [sys.executable, "-m", "veritybench.local_worker", "--worker"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(resolved_path.parent),
-            env=_worker_environment(),
-            close_fds=True,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise LocalWorkerError("worker_launch_failed", f"could not start local worker: {exc}") from exc
-
-    if process.stdin is None or process.stdout is None or process.stderr is None:
-        _stop_process(process)
-        raise LocalWorkerError("worker_launch_failed", "local worker pipes were not created")
-    try:
-        process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
-        process.stdin.close()
-    except OSError as exc:
-        _stop_process(process)
-        raise LocalWorkerError("worker_launch_failed", f"could not send worker request: {exc}") from exc
-
-    stdout_capture = _CapturedStream.create(MAX_WORKER_OUTPUT_BYTES)
-    stderr_capture = _CapturedStream.create(MAX_WORKER_DIAGNOSTIC_BYTES)
-    messages: queue.Queue[str] = queue.Queue(maxsize=128)
-    stdout_thread = threading.Thread(
-        target=_read_stream,
-        args=(process.stdout, stdout_capture, messages),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_read_stream,
-        args=(process.stderr, stderr_capture),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-
-    result: dict[str, object] | None = None
-    worker_error: LocalWorkerError | None = None
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        try:
-            line = messages.get(timeout=0.02)
-        except queue.Empty:
-            line = None
-        if line is not None and worker_error is None:
+        with stage_agent(agent_path) as staged_agent:
+            request = {
+                "protocol_version": WORKER_PROTOCOL_VERSION,
+                "agent_contract_version": AGENT_CONTRACT_VERSION,
+                "agent_path": AGENT_CONTAINER_PATH,
+                "simulation": _simulation_config_to_dict(config),
+            }
             try:
-                payload = _parse_protocol_line(line)
-                message_type = payload["type"]
-                if message_type == "event":
-                    event = payload.get("event")
-                    if not isinstance(event, dict):
-                        raise LocalWorkerError("worker_protocol_error", "worker event must be an object")
-                    if on_event is not None:
-                        on_event(event)
-                elif message_type == "result":
-                    candidate = payload.get("result")
-                    if not isinstance(candidate, dict):
-                        raise LocalWorkerError("worker_protocol_error", "worker result must be an object")
-                    result = candidate
-                elif message_type == "error":
-                    error = payload.get("error")
-                    if not isinstance(error, dict):
-                        raise LocalWorkerError("worker_protocol_error", "worker error must be an object")
-                    code = error.get("code")
-                    message = error.get("message")
-                    if not isinstance(code, str) or not isinstance(message, str):
-                        raise LocalWorkerError("worker_protocol_error", "worker error lacks code/message")
-                    worker_error = LocalWorkerError(code, message)
-                elif message_type != "diagnostic":
-                    raise LocalWorkerError("worker_protocol_error", f"unknown worker message type: {message_type}")
-            except LocalWorkerError as exc:
-                worker_error = exc
+                process = subprocess.Popen(  # nosec B603 - command is the fixed Docker sandbox invocation  # noqa: S603
+                    [*sandbox.command, *sandbox.run_arguments(staged_agent, container_name)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"},
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise LocalWorkerError("worker_launch_failed", f"could not start Docker sandbox: {exc}") from exc
 
-        process_finished = process.poll() is not None
-        streams_finished = not stdout_thread.is_alive() and not stderr_thread.is_alive()
-        if process_finished and streams_finished and messages.empty():
-            break
-        if time.monotonic() >= deadline:
-            _stop_process(process)
+            if process.stdin is None or process.stdout is None or process.stderr is None:
+                _stop_process(process)
+                raise LocalWorkerError("worker_launch_failed", "Docker sandbox pipes were not created")
+            try:
+                process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                process.stdin.close()
+            except OSError as exc:
+                _stop_process(process)
+                raise LocalWorkerError("worker_launch_failed", f"could not send worker request: {exc}") from exc
+
+            stdout_capture = _CapturedStream.create(MAX_WORKER_OUTPUT_BYTES)
+            stderr_capture = _CapturedStream.create(MAX_WORKER_DIAGNOSTIC_BYTES)
+            messages: queue.Queue[str] = queue.Queue(maxsize=128)
+            stdout_thread = threading.Thread(
+                target=_read_stream,
+                args=(process.stdout, stdout_capture, messages),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_read_stream,
+                args=(process.stderr, stderr_capture),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            result: dict[str, object] | None = None
+            worker_error: LocalWorkerError | None = None
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                try:
+                    line = messages.get(timeout=0.02)
+                except queue.Empty:
+                    line = None
+                if line is not None and worker_error is None:
+                    try:
+                        payload = _parse_protocol_line(line)
+                        message_type = payload["type"]
+                        if message_type == "event":
+                            event = payload.get("event")
+                            if not isinstance(event, dict):
+                                raise LocalWorkerError("worker_protocol_error", "worker event must be an object")
+                            if on_event is not None:
+                                on_event(event)
+                        elif message_type == "result":
+                            candidate = payload.get("result")
+                            if not isinstance(candidate, dict):
+                                raise LocalWorkerError("worker_protocol_error", "worker result must be an object")
+                            result = candidate
+                        elif message_type == "error":
+                            error = payload.get("error")
+                            if not isinstance(error, dict):
+                                raise LocalWorkerError("worker_protocol_error", "worker error must be an object")
+                            code = error.get("code")
+                            message = error.get("message")
+                            if not isinstance(code, str) or not isinstance(message, str):
+                                raise LocalWorkerError("worker_protocol_error", "worker error lacks code/message")
+                            worker_error = LocalWorkerError(code, message)
+                        elif message_type != "diagnostic":
+                            raise LocalWorkerError(
+                                "worker_protocol_error", f"unknown worker message type: {message_type}"
+                            )
+                    except LocalWorkerError as exc:
+                        worker_error = exc
+
+                process_finished = process.poll() is not None
+                streams_finished = not stdout_thread.is_alive() and not stderr_thread.is_alive()
+                if process_finished and streams_finished and messages.empty():
+                    break
+                if time.monotonic() >= deadline:
+                    _stop_process(process)
+                    stdout_thread.join(timeout=1)
+                    stderr_thread.join(timeout=1)
+                    raise LocalWorkerError(
+                        "agent_timeout",
+                        f"local agent exceeded the {timeout_seconds:g}-second timeout",
+                    )
+
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
-            raise LocalWorkerError(
-                "agent_timeout",
-                f"local agent exceeded the {timeout_seconds:g}-second timeout",
-            )
+            if stdout_capture.truncated or stdout_capture.malformed_line:
+                raise LocalWorkerError(
+                    "worker_output_limit",
+                    f"local worker output exceeded the {MAX_WORKER_OUTPUT_BYTES} byte limit",
+                )
+            if worker_error is not None:
+                raise worker_error
+            if process.returncode != 0:
+                diagnostic = stderr_capture.data.decode("utf-8", errors="replace").strip()
+                suffix = f": {diagnostic[:500]}" if diagnostic else ""
+                raise LocalWorkerError(
+                    "worker_failed", f"local worker exited with code {process.returncode}{suffix}"
+                )
+            if result is None:
+                raise LocalWorkerError("worker_protocol_error", "local worker exited without a result")
+            return result
+    except SandboxError as exc:
+        raise LocalWorkerError(exc.code, exc.message) from exc
+    finally:
+        if process is not None and process.poll() is None:
+            _stop_process(process)
+        sandbox.cleanup(container_name)
 
-    stdout_thread.join(timeout=1)
-    stderr_thread.join(timeout=1)
-    if stdout_capture.truncated or stdout_capture.malformed_line:
-        raise LocalWorkerError(
-            "worker_output_limit",
-            f"local worker output exceeded the {MAX_WORKER_OUTPUT_BYTES} byte limit",
-        )
-    if worker_error is not None:
-        raise worker_error
-    if process.returncode != 0:
-        diagnostic = stderr_capture.data.decode("utf-8", errors="replace").strip()
-        suffix = f": {diagnostic[:500]}" if diagnostic else ""
-        raise LocalWorkerError("worker_failed", f"local worker exited with code {process.returncode}{suffix}")
-    if result is None:
-        raise LocalWorkerError("worker_protocol_error", "local worker exited without a result")
-    return result
+
+def run_sandboxed_agent(
+    agent_path: Path,
+    config: SimulationConfig,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    on_event: Callable[[dict[str, object]], None] | None = None,
+    runtime_command: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Run an agent in Docker while keeping the engine/evaluator in the parent."""
+
+    if timeout_seconds <= 0:
+        raise LocalWorkerError("invalid_timeout", "timeout must be greater than zero seconds")
+    try:
+        validate_agent_source(agent_path)
+        sandbox = DockerSandbox.from_environment(runtime_command)
+        sandbox.preflight()
+    except SandboxError as exc:
+        raise LocalWorkerError(exc.code, exc.message) from exc
+
+    container_name = sandbox.container_name()
+    process: subprocess.Popen[bytes] | None = None
+    stdout_thread: threading.Thread | None = None
+    stderr_thread: threading.Thread | None = None
+    try:
+        with stage_agent(agent_path) as staged_agent:
+            try:
+                process = subprocess.Popen(  # nosec B603 - command is the fixed Docker sandbox invocation  # noqa: S603
+                    [*sandbox.command, *sandbox.run_arguments(staged_agent, container_name, "decision-worker")],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"},
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise LocalWorkerError("worker_launch_failed", f"could not start Docker sandbox: {exc}") from exc
+            if process.stdin is None or process.stdout is None or process.stderr is None:
+                _stop_process(process)
+                raise LocalWorkerError("worker_launch_failed", "Docker sandbox pipes were not created")
+            decision_stdin = process.stdin
+
+            stdout_capture = _CapturedStream.create(MAX_WORKER_OUTPUT_BYTES)
+            stderr_capture = _CapturedStream.create(MAX_WORKER_DIAGNOSTIC_BYTES)
+            messages: queue.Queue[str] = queue.Queue(maxsize=128)
+            stdout_thread = threading.Thread(
+                target=_read_stream, args=(process.stdout, stdout_capture, messages), daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=_read_stream, args=(process.stderr, stderr_capture), daemon=True
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            deadline = time.monotonic() + timeout_seconds
+
+            def wait_message() -> dict[str, object]:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        diagnostic = stderr_capture.data.decode("utf-8", errors="replace").strip()
+                        suffix = f": {diagnostic[:500]}" if diagnostic else ""
+                        raise LocalWorkerError(
+                            "agent_timeout",
+                            f"local agent exceeded the {timeout_seconds:g}-second timeout{suffix}",
+                        )
+                    try:
+                        line = messages.get(timeout=min(0.05, remaining))
+                    except queue.Empty:
+                        if process is not None and process.poll() is not None and not stdout_thread.is_alive():
+                            raise LocalWorkerError(
+                                "worker_failed",
+                                f"decision worker exited with code {process.returncode}",
+                            ) from None
+                        continue
+                    return _parse_protocol_line(line)
+
+            def send(payload: dict[str, object]) -> None:
+                try:
+                    decision_stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+                    decision_stdin.flush()
+                except OSError as exc:
+                    raise LocalWorkerError("worker_launch_failed", "decision worker pipe closed") from exc
+
+            send(
+                {
+                    "protocol_version": WORKER_PROTOCOL_VERSION,
+                    "type": "init",
+                    "agent_contract_version": AGENT_CONTRACT_VERSION,
+                    "agent_path": AGENT_CONTAINER_PATH,
+                }
+            )
+            ready = wait_message()
+            if ready.get("type") != "ready" or not isinstance(ready.get("name"), str):
+                raise LocalWorkerError("worker_protocol_error", "decision worker did not become ready")
+
+            class DecisionProxy:
+                name = str(ready["name"])
+
+                def decide(self, context: AgentContext) -> AgentDecision:
+                    sequence = getattr(self, "_sequence", 0)
+                    send(
+                        {
+                            "protocol_version": WORKER_PROTOCOL_VERSION,
+                            "type": "decide",
+                            "sequence": sequence,
+                            "context": context_to_dict(context),
+                        }
+                    )
+                    response = wait_message()
+                    if response.get("type") != "decision" or response.get("sequence") != sequence:
+                        raise LocalWorkerError("worker_protocol_error", "decision worker response was out of order")
+                    decision = decision_from_dict(response.get("decision"))
+                    self._sequence = sequence + 1
+                    return decision
+
+            trusted_agent = validate_agent(DecisionProxy())
+
+            def engine_event(event: ExecutionEvent) -> None:
+                if on_event is not None:
+                    on_event(event.to_dict())
+
+            result = DeterministicEngine(config).run(trusted_agent, on_event=engine_event)
+            process.stdin.close()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired as exc:
+                _stop_process(process)
+                raise LocalWorkerError("worker_shutdown_timeout", "decision worker did not shut down") from exc
+            if stdout_capture.truncated or stdout_capture.malformed_line:
+                raise LocalWorkerError("worker_output_limit", "decision worker output exceeded its limit")
+            return result.to_dict()
+    except AgentContractError as exc:
+        raise LocalWorkerError(exc.code, exc.message) from exc
+    except SandboxError as exc:
+        raise LocalWorkerError(exc.code, exc.message) from exc
+    finally:
+        if stdout_thread is not None:
+            stdout_thread.join(timeout=1)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1)
+        if process is not None and process.poll() is None:
+            _stop_process(process)
+        sandbox.cleanup(container_name)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] != "--worker":
+    if len(sys.argv) != 2 or sys.argv[1] not in {"--worker", "--decision-worker"}:
         raise SystemExit("This module is started by `veritybench test --agent-path`; it is not an agent entrypoint.")
-    raise SystemExit(_worker_main())
+    raise SystemExit(_worker_main() if sys.argv[1] == "--worker" else _decision_worker_main())

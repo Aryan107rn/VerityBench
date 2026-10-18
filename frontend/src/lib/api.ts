@@ -5,18 +5,30 @@ export type ApiAgent = {
   key: string
   name: string
   description: string
-  source: 'repository'
+  source: 'repository' | 'remote'
   runnable: boolean
   supported_scenarios: string[]
+  version?: string | null
+  status?: 'enabled' | 'disabled'
 }
 
-export type SupportedAgent = 'safe' | 'defective'
+export type SupportedAgent = string
 export type SupportedScenario =
   | 'normal'
   | 'timeout_after_success'
   | 'malformed_response'
   | 'temporary_failure'
   | 'unrecoverable_failure'
+
+export type ApiRunState =
+  | 'queued'
+  | 'running'
+  | 'cancel_requested'
+  | 'passed'
+  | 'failed'
+  | 'timed_out'
+  | 'inconclusive'
+  | 'cancelled'
 
 export type ApiTraceEvent = {
   index: number
@@ -89,8 +101,8 @@ export type ApiEvaluation = ApiReport['evaluation']
 export type ApiRun = {
   id: string
   project_id: string
-  state: string
-  agent: SupportedAgent
+  state: ApiRunState | string
+  agent: string
   scenario: string
   cancel_requested: boolean
   created_at: string
@@ -126,6 +138,8 @@ export type ApiClient = {
   createProject: (token: string, name: string, description?: string) => Promise<ApiProject>
   listProjectRuns: (token: string, projectId: string) => Promise<ApiRunSummary[]>
   listAgents: (token: string, projectId: string) => Promise<ApiAgent[]>
+  registerAgent: (token: string, projectId: string, name: string, version: string, source: string) => Promise<ApiAgent>
+  disableAgent: (token: string, projectId: string, agentId: string) => Promise<void>
   createRun: (token: string, projectId: string, agent: SupportedAgent, scenario: SupportedScenario) => Promise<ApiRun>
   getApiRun: (token: string, runId: string) => Promise<ApiRun>
   listRunEvents: (token: string, runId: string, afterSequence?: number, limit?: number) => Promise<ApiRunEvent[]>
@@ -171,6 +185,24 @@ export function createApiClient(baseUrl = import.meta.env.VITE_API_URL ?? 'http:
     createProject: (token, name, description = '') => request('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name, description }) }, token),
     listProjectRuns: (token, projectId) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, undefined, token),
     listAgents: (token, projectId) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/agents`, undefined, token),
+    registerAgent: async (token, projectId, name, version, source) => {
+      const registration = await request<{ id: string; name: string; version: string }>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/agents`,
+        { method: 'POST', body: JSON.stringify({ name, version, source }) },
+        token,
+      )
+      return {
+        key: `remote:${registration.id}`,
+        name: registration.name,
+        version: registration.version,
+        description: 'Project-registered Python agent executed by the isolated worker.',
+        source: 'remote',
+        runnable: true,
+        status: 'enabled',
+        supported_scenarios: ['normal', 'timeout_after_success', 'malformed_response', 'temporary_failure', 'unrecoverable_failure'],
+      }
+    },
+    disableAgent: (token, projectId, agentId) => request<void>(`/api/v1/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' }, token),
     createRun: (token, projectId, agent, scenario) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, { method: 'POST', body: JSON.stringify({ agent, scenario }) }, token),
     getApiRun: (token, runId) => request(`/api/v1/runs/${encodeURIComponent(runId)}`, undefined, token),
     listRunEvents: (token, runId, afterSequence = -1, limit = 500) => request(`/api/v1/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=${limit}`, undefined, token),
