@@ -14,6 +14,15 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Early local builds created the schema with SQLAlchemy's create_all before
+    # Alembic was introduced. If that complete schema is already present, keep
+    # the user's data and let Alembic record this baseline revision instead of
+    # attempting to create the tables a second time.
+    existing_tables = set(sa.inspect(op.get_bind()).get_table_names())
+    expected_tables = {"users", "projects", "runs", "session_tokens", "audit_events"}
+    if expected_tables.issubset(existing_tables):
+        return
+
     op.create_table(
         "users",
         sa.Column("id", sa.String(length=36), primary_key=True),

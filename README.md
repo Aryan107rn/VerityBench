@@ -53,9 +53,13 @@ Run the API and frontend in two terminals from the repository root. Keep the
 Python virtual environment active in the API terminal:
 
 ```bash
+alembic upgrade head
 python -m uvicorn veritybench.api.main:app --reload --port 8000
 cd frontend && npm run dev
 ```
+
+The initial migration safely baselines an existing complete local SQLite schema;
+it does not delete data from databases created by earlier builds.
 
 Open <http://localhost:5173>. The API health and readiness endpoints are
 <http://localhost:8000/health> and <http://localhost:8000/ready>; interactive

@@ -21,6 +21,10 @@ alembic upgrade head
 uvicorn veritybench.api.main:app --host 0.0.0.0 --port 8000
 ```
 
+If a pre-Alembic local SQLite database already contains the VerityBench tables,
+the initial migration recognizes that complete schema and records its baseline
+without deleting data. Do not delete the database to recover from this case.
+
 The current session design stores a hash of an opaque bearer token in the
 database. Rotate/revoke sessions by deleting the session record. For multiple
 API instances, move rate limiting to a shared store and put long runs behind a
