@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
 import { Icon, type IconName } from './components/Icon'
-import { demoCoverage, demoEvaluators, demoRuns, demoTrend } from './data/demo'
+import { demoCoverage, demoEvaluators, demoRuns } from './data/demo'
 import {
   createApiClient,
   type ApiClient,
@@ -15,15 +15,51 @@ import {
 } from './lib/api'
 import type { CoverageItem, EvaluatorResult, Run, TrendPoint, View } from './types'
 
-const navItems: Array<{ id: View; label: string; icon: IconName }> = [
-  { id: 'overview', label: 'Overview', icon: 'layers' },
-  { id: 'dashboard', label: 'Agent runs', icon: 'activity' },
+type Session = { token: string; user: ApiUser }
+type Theme = 'light' | 'dark'
+type ApiStatus = 'checking' | 'online' | 'offline'
+type LocalDataset = {
+  id: string
+  name: string
+  description: string
+  cases: number
+  kind: 'fixture' | 'local'
+  updated: string
+}
+type LocalSettings = { showFixtureHints: boolean; compactRows: boolean }
+
+type DashboardStats = {
+  passRate: string
+  evaluated: string
+  traceCount: string
+  duplicateCharges: string
+  safeRetests: string
+}
+
+const sessionStorageKey = 'veritybench.session'
+const projectStorageKey = 'veritybench.project'
+const themeStorageKey = 'veritybench.theme'
+const datasetsStorageKey = 'veritybench.local-datasets'
+const evaluatorStorageKey = 'veritybench.local-evaluators'
+const settingsStorageKey = 'veritybench.local-settings'
+
+const navItems: Array<{ id: View; label: string; icon: IconName; path: string }> = [
+  { id: 'overview', label: 'Overview', icon: 'layers', path: '/' },
+  { id: 'dashboard', label: 'Agent runs', icon: 'activity', path: '/runs' },
+  { id: 'datasets', label: 'Datasets', icon: 'database', path: '/datasets' },
+  { id: 'evaluators', label: 'Evaluators', icon: 'sliders', path: '/evaluators' },
+  { id: 'settings', label: 'Settings', icon: 'settings', path: '/settings' },
+  { id: 'cli', label: 'CLI guide', icon: 'terminal', path: '/cli' },
 ]
 
 const viewLabels: Record<View, string> = {
   overview: 'Overview',
   dashboard: 'Agent runs',
   run: 'Run detail',
+  datasets: 'Datasets',
+  evaluators: 'Evaluators',
+  settings: 'Settings',
+  cli: 'CLI guide',
 }
 
 const scenarios: Array<{ value: SupportedScenario; label: string; description: string }> = [
@@ -38,31 +74,53 @@ const scenarioLabels: Record<SupportedScenario, string> = Object.fromEntries(
   scenarios.map((scenario) => [scenario.value, scenario.label]),
 ) as Record<SupportedScenario, string>
 
-type Session = { token: string; user: ApiUser }
+const defaultDatasets: LocalDataset[] = [
+  { id: 'payment-timeout-suite', name: 'Payment timeout suite', description: 'Controlled payment outcomes for retry and reconciliation behavior.', cases: 5, kind: 'fixture', updated: 'Repository fixture' },
+  { id: 'malformed-response', name: 'Malformed response', description: 'Provider payloads that test schema validation and safe failure handling.', cases: 3, kind: 'fixture', updated: 'Repository fixture' },
+  { id: 'local-checkout-smoke', name: 'Local checkout smoke', description: 'A local selection placeholder for a small checkout regression set.', cases: 0, kind: 'local', updated: 'Created locally' },
+]
 
-type DashboardStats = {
-  passRate: string
-  passCount: string
-  traceCount: string
-  duplicateCharges: string
-  safeRetests: string
-}
+const evaluatorDefinitions = [
+  { id: 'order-state', name: 'Order state invariant', description: 'Checks the final order state independently of the agent claim.', owner: 'Core' },
+  { id: 'payment-ledger', name: 'Payment ledger invariant', description: 'Detects duplicate or mismatched settlements in the ledger.', owner: 'Payments' },
+  { id: 'timeout-reconciliation', name: 'Timeout reconciliation', description: 'Requires provider-state reconciliation before fulfillment.', owner: 'Payments' },
+  { id: 'trace-sufficiency', name: 'Trace sufficiency', description: 'Confirms the report contains enough observable evidence.', owner: 'Evidence' },
+]
 
-const sessionStorageKey = 'veritybench.session'
-const projectStorageKey = 'veritybench.project'
-
-function readStoredSession(): Session | null {
+function readStorage<T>(key: string, fallback: T): T {
   try {
-    const value = window.localStorage.getItem(sessionStorageKey)
-    if (!value) return null
-    const session = JSON.parse(value) as Session
-    return session.token && session.user?.email ? session : null
+    const value = window.localStorage.getItem(key)
+    return value ? (JSON.parse(value) as T) : fallback
   } catch {
-    return null
+    return fallback
   }
 }
 
-function readStoredProject(): string | null {
+function writeStorage<T>(key: string, value: T) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // Restricted storage should not block the application.
+  }
+}
+
+function readStoredSession(): Session | null {
+  const session = readStorage<Session | null>(sessionStorageKey, null)
+  return session?.token && session.user?.email ? session : null
+}
+
+function readStoredTheme(): Theme {
+  const stored = readStorage<Theme | null>(themeStorageKey, null)
+  if (stored === 'light' || stored === 'dark') return stored
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function readStoredDatasets(): LocalDataset[] {
+  const stored = readStorage<LocalDataset[] | null>(datasetsStorageKey, null)
+  return stored?.length ? stored : defaultDatasets
+}
+
+function readStoredProject() {
   try {
     return window.localStorage.getItem(projectStorageKey)
   } catch {
@@ -70,12 +128,21 @@ function readStoredProject(): string | null {
   }
 }
 
+function readStoredEvaluators() {
+  const stored = readStorage<string[] | null>(evaluatorStorageKey, null)
+  return stored ?? evaluatorDefinitions.map((evaluator) => evaluator.id)
+}
+
+function readStoredSettings(): LocalSettings {
+  return readStorage<LocalSettings>(settingsStorageKey, { showFixtureHints: true, compactRows: false })
+}
+
 function saveStoredProject(projectId: string | null) {
   try {
     if (projectId) window.localStorage.setItem(projectStorageKey, projectId)
     else window.localStorage.removeItem(projectStorageKey)
   } catch {
-    // A restricted browser storage implementation should not block the UI.
+    // Ignore restricted storage.
   }
 }
 
@@ -113,7 +180,7 @@ function apiRunToView(run: ApiRun): Run {
     id: run.id,
     name: report?.agent_name ?? `${run.agent}-sample-agent`,
     model: report?.agent_name ?? `${run.agent}-sample-agent`,
-    modelVersion: report ? 'persisted report' : 'report unavailable',
+    modelVersion: report ? 'Persisted report' : 'Report unavailable',
     dataset: formatScenario(run.scenario),
     status: run.state === 'passed' ? 'completed' : run.state === 'failed' ? 'needs-review' : 'running',
     score: runScore(report),
@@ -135,10 +202,22 @@ function buildApiStats(runs: ApiRun[]): DashboardStats {
   const safeRetests = reports.filter((report) => report.agent_name === 'safe-sample-agent' && report.evaluation.passed).length
   return {
     passRate: reports.length ? `${Math.round((passed / reports.length) * 100)}%` : '—',
-    passCount: reports.length ? `${passed} / ${reports.length}` : '—',
+    evaluated: reports.length ? `${passed} / ${reports.length} passed` : '—',
     traceCount: reports.length ? formatNumber(totalTraces) : '—',
     duplicateCharges: reports.length ? formatNumber(duplicateCharges) : '—',
     safeRetests: reports.length ? formatNumber(safeRetests) : '—',
+  }
+}
+
+function buildFixtureStats(): DashboardStats {
+  const passed = demoRuns.filter((run) => run.status === 'completed').length
+  const traceCount = demoRuns.reduce((total, run) => total + Number.parseInt(run.duration, 10), 0)
+  return {
+    passRate: `${Math.round((passed / demoRuns.length) * 100)}%`,
+    evaluated: `${passed} / ${demoRuns.length} passed`,
+    traceCount: formatNumber(traceCount),
+    duplicateCharges: '—',
+    safeRetests: formatNumber(demoRuns.filter((run) => run.model === 'safe-sample-agent').length),
   }
 }
 
@@ -158,45 +237,37 @@ function buildApiCoverage(runs: ApiRun[]): CoverageItem[] {
   }))
 }
 
-function buildTrend(runs: ApiRun[]): TrendPoint[] {
+function buildTrend(runs: Run[]): TrendPoint[] {
   return runs
-    .map(apiRunToView)
     .filter((run): run is Run & { score: number } => run.score !== null)
     .reverse()
-    .map((run) => ({ label: run.id.slice(0, 8), value: run.score }))
+    .map((run) => ({ label: run.id.slice(0, 10), value: run.score }))
+}
+
+function pageForPath(pathname: string): View {
+  if (pathname === '/runs') return 'dashboard'
+  if (pathname.startsWith('/runs/')) return 'run'
+  if (pathname === '/datasets') return 'datasets'
+  if (pathname === '/evaluators') return 'evaluators'
+  if (pathname === '/settings') return 'settings'
+  if (pathname === '/cli') return 'cli'
+  return 'overview'
 }
 
 function StatusBadge({ status }: { status: Run['status'] }) {
-  const labels: Record<Run['status'], string> = {
-    completed: 'Completed',
-    running: 'Running',
-    'needs-review': 'Needs review',
-  }
-
-  return (
-    <span className={`status-badge status-${status}`}>
-      <span className="status-dot" />
-      {labels[status]}
-    </span>
-  )
+  const labels: Record<Run['status'], string> = { completed: 'Passed', running: 'Running', 'needs-review': 'Needs review' }
+  return <span className={`status-badge status-${status}`}><span className="status-dot" />{labels[status]}</span>
 }
 
-function DemoPill({ apiStatus, apiMode }: { apiStatus: 'checking' | 'online' | 'offline'; apiMode: boolean }) {
-  const label = apiMode ? 'Live API · persisted' : apiStatus === 'offline' ? 'Offline demo · fixtures' : apiStatus === 'checking' ? 'Checking API' : 'Demo fallback · fixtures'
-  return (
-    <span className={`demo-pill ${apiMode ? 'demo-pill-live' : ''}`}>
-      <span className="demo-pulse" />
-      {label}
-    </span>
-  )
+function SourceBadge({ apiMode, apiStatus }: { apiMode: boolean; apiStatus: ApiStatus }) {
+  const label = apiMode ? 'Live API · persisted' : apiStatus === 'offline' ? 'Offline fallback · fixtures' : apiStatus === 'checking' ? 'Checking API' : 'Local fixture mode'
+  return <span className={`source-badge ${apiMode ? 'source-live' : ''}`}><span className="source-dot" />{label}</span>
 }
 
 function BrandMark() {
   return (
     <span aria-hidden="true" className="brand-mark">
-      <span />
-      <span />
-      <span />
+      <svg viewBox="0 0 32 32"><path d="M5 7.5 16 24 27 7.5" /><path d="M9.5 8.5 16 18l6.5-9.5" /><circle cx="5" cy="7.5" r="2" /><circle cx="27" cy="7.5" r="2" /></svg>
     </span>
   )
 }
@@ -205,9 +276,10 @@ function Workspace() {
   const api = useMemo(() => createApiClient(), [])
   const location = useLocation()
   const navigate = useNavigate()
-  const view: View = location.pathname === '/runs' ? 'dashboard' : location.pathname.startsWith('/runs/') ? 'run' : 'overview'
+  const view = pageForPath(location.pathname)
   const selectedRunId = location.pathname.startsWith('/runs/') ? decodeURIComponent(location.pathname.slice('/runs/'.length)) : null
-  const [apiStatus, setApiStatus] = useState<'checking' | 'online' | 'offline'>('checking')
+  const [theme, setTheme] = useState<Theme>(() => readStoredTheme())
+  const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
   const [authOpen, setAuthOpen] = useState(false)
   const [session, setSession] = useState<Session | null>(() => readStoredSession())
   const [projects, setProjects] = useState<ApiProject[]>([])
@@ -220,7 +292,10 @@ function Workspace() {
   const [runComposerOpen, setRunComposerOpen] = useState(false)
   const [runBusy, setRunBusy] = useState(false)
   const [runComposerError, setRunComposerError] = useState('')
-  const [demoBannerVisible, setDemoBannerVisible] = useState(true)
+  const [noticeVisible, setNoticeVisible] = useState(true)
+  const [localDatasets, setLocalDatasets] = useState<LocalDataset[]>(() => readStoredDatasets())
+  const [enabledEvaluators, setEnabledEvaluators] = useState<string[]>(() => readStoredEvaluators())
+  const [localSettings, setLocalSettings] = useState<LocalSettings>(() => readStoredSettings())
 
   const token = session?.token ?? null
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
@@ -228,16 +303,31 @@ function Workspace() {
   const displayRuns = apiMode ? apiRuns.map(apiRunToView) : demoRuns
   const selectedApiRun = apiRuns.find((run) => run.id === selectedRunId) ?? null
   const selectedRun = apiMode ? (selectedApiRun ? apiRunToView(selectedApiRun) : null) : demoRuns.find((run) => run.id === selectedRunId) ?? demoRuns[0]
-  const apiStats = useMemo(() => buildApiStats(apiRuns), [apiRuns])
+  const stats = useMemo(() => apiMode ? buildApiStats(apiRuns) : buildFixtureStats(), [apiMode, apiRuns])
   const coverage = apiMode ? buildApiCoverage(apiRuns) : demoCoverage
-  const trend = apiMode ? buildTrend(apiRuns) : demoTrend
+  const trend = apiMode ? buildTrend(apiRuns.map(apiRunToView)) : buildTrend(demoRuns)
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    writeStorage(themeStorageKey, theme)
+  }, [theme])
+
+  useEffect(() => {
+    writeStorage(datasetsStorageKey, localDatasets)
+  }, [localDatasets])
+
+  useEffect(() => {
+    writeStorage(evaluatorStorageKey, enabledEvaluators)
+  }, [enabledEvaluators])
+
+  useEffect(() => {
+    writeStorage(settingsStorageKey, localSettings)
+  }, [localSettings])
 
   useEffect(() => {
     let active = true
     api.getHealth().then(() => active && setApiStatus('online')).catch(() => active && setApiStatus('offline'))
-    return () => {
-      active = false
-    }
+    return () => { active = false }
   }, [api])
 
   useEffect(() => {
@@ -249,7 +339,6 @@ function Workspace() {
       setApiRuns([])
       return
     }
-
     setProjectsLoading(true)
     setProjectError('')
     api.listProjects(token).then((nextProjects) => {
@@ -263,10 +352,7 @@ function Workspace() {
     }).catch((error: unknown) => {
       if (active) setProjectError(error instanceof Error ? error.message : 'Could not load projects.')
     }).finally(() => active && setProjectsLoading(false))
-
-    return () => {
-      active = false
-    }
+    return () => { active = false }
   }, [api, token])
 
   useEffect(() => {
@@ -277,7 +363,6 @@ function Workspace() {
       setRunsLoading(false)
       return
     }
-
     setRunsLoading(true)
     setRunError('')
     api.listProjectRuns(token, selectedProjectId).then(async (summaries) => {
@@ -286,10 +371,7 @@ function Workspace() {
     }).catch((error: unknown) => {
       if (active) setRunError(error instanceof Error ? error.message : 'Could not load persisted runs.')
     }).finally(() => active && setRunsLoading(false))
-
-    return () => {
-      active = false
-    }
+    return () => { active = false }
   }, [api, selectedProjectId, token])
 
   useEffect(() => {
@@ -301,34 +383,20 @@ function Workspace() {
     }).catch((error: unknown) => {
       if (active) setRunError(error instanceof Error ? error.message : 'Could not load this persisted run.')
     }).finally(() => active && setRunsLoading(false))
-    return () => {
-      active = false
-    }
+    return () => { active = false }
   }, [api, apiMode, selectedApiRun, selectedProjectId, selectedRunId, token, view])
 
   const setSignedIn = (nextSession: Session) => {
-    try {
-      window.localStorage.setItem(sessionStorageKey, JSON.stringify(nextSession))
-    } catch {
-      // The current session still works when persistent storage is unavailable.
-    }
+    writeStorage(sessionStorageKey, nextSession)
     setSession(nextSession)
     setAuthOpen(false)
   }
 
   const signOut = async () => {
     if (token) {
-      try {
-        await api.logout(token)
-      } catch {
-        // Clearing the local session is still the correct client-side logout.
-      }
+      try { await api.logout(token) } catch { /* Local session cleanup still applies. */ }
     }
-    try {
-      window.localStorage.removeItem(sessionStorageKey)
-    } catch {
-      // Ignore restricted storage.
-    }
+    try { window.localStorage.removeItem(sessionStorageKey) } catch { /* Ignore restricted storage. */ }
     setSession(null)
     setProjects([])
     setApiRuns([])
@@ -358,14 +426,8 @@ function Workspace() {
   }
 
   const requestRun = () => {
-    if (!session) {
-      setAuthOpen(true)
-      return
-    }
-    if (!selectedProjectId) {
-      setProjectError('Create or select a project before starting a persisted run.')
-      return
-    }
+    if (!session) { setAuthOpen(true); return }
+    if (!selectedProjectId) { setProjectError('Create or select a project before starting a persisted run.'); navigate('/runs'); return }
     setRunComposerError('')
     setRunComposerOpen(true)
     navigate('/runs')
@@ -377,8 +439,6 @@ function Workspace() {
     setRunComposerError('')
     try {
       const created = await api.createRun(token, selectedProjectId, agent, scenario)
-      // Read it back through the protected detail endpoint so the detail page
-      // always renders the persisted report, rather than a transient response.
       const persisted = await api.getApiRun(token, created.id)
       setApiRuns((current) => [persisted, ...current.filter((run) => run.id !== persisted.id)])
       setRunComposerOpen(false)
@@ -390,136 +450,70 @@ function Workspace() {
     }
   }
 
-  const setView = (nextView: View) => navigate(nextView === 'overview' ? '/' : '/runs')
+  const setView = (nextView: View) => {
+    const item = navItems.find((navItem) => navItem.id === nextView)
+    navigate(item?.path ?? '/')
+  }
+
   const openRun = (runId: string) => navigate(`/runs/${encodeURIComponent(runId)}`)
+  const updateLocalSettings = (next: Partial<LocalSettings>) => setLocalSettings((current) => ({ ...current, ...next }))
+  const resetLocalConfig = () => {
+    setLocalDatasets(defaultDatasets)
+    setEnabledEvaluators(evaluatorDefinitions.map((evaluator) => evaluator.id))
+    setLocalSettings({ showFixtureHints: true, compactRows: false })
+  }
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="sidebar-top">
-          <div className="brand-lockup">
-            <BrandMark />
-            <span className="brand-name">verity<span>bench</span></span>
-          </div>
-          <button aria-label="Collapse navigation" className="icon-button sidebar-collapse" type="button">
-            <Icon name="menu" size={19} />
+          <button className="brand-lockup" onClick={() => navigate('/')} type="button">
+            <BrandMark /><span className="brand-name">verity<span>bench</span></span>
           </button>
+          <span className="brand-version">v0.1</span>
         </div>
-
         <div className="workspace-switcher">
           <span className="workspace-avatar">{selectedProject?.name.slice(0, 1).toUpperCase() ?? 'V'}</span>
-          <span className="workspace-copy">
-            <span className="workspace-label">Workspace</span>
-            <strong>{selectedProject?.name ?? 'demo fallback workspace'}</strong>
-          </span>
+          <span className="workspace-copy"><span className="workspace-label">Workspace</span><strong>{selectedProject?.name ?? 'Local explorer'}</strong></span>
           <Icon name="chevron-down" size={15} />
         </div>
-
         <nav aria-label="Main navigation" className="main-nav">
           <span className="nav-section-label">Workspace</span>
-          {navItems.map((item) => (
-            <button
-              aria-current={view === item.id || (view === 'run' && item.id === 'dashboard') ? 'page' : undefined}
-              className={`nav-item ${view === item.id || (view === 'run' && item.id === 'dashboard') ? 'is-active' : ''}`}
-              key={item.id}
-              onClick={() => setView(item.id)}
-              type="button"
-            >
-              <Icon name={item.icon} size={17} />
-              <span className="nav-label">{item.label}</span>
-              {item.id === 'dashboard' && <span className="nav-count">{String(displayRuns.length).padStart(2, '0')}</span>}
-            </button>
-          ))}
-
-          <span className="nav-section-label nav-section-spaced">Manage</span>
-          <button className="nav-item" type="button">
-            <Icon name="database" size={17} />
-            <span className="nav-label">Datasets</span>
-            <span className="nav-soon">Soon</span>
-          </button>
-          <button className="nav-item" type="button">
-            <Icon name="sliders" size={17} />
-            <span className="nav-label">Evaluators</span>
-            <span className="nav-soon">Soon</span>
-          </button>
-          <button className="nav-item" type="button">
-            <Icon name="settings" size={17} />
-            <span className="nav-label">Settings</span>
-          </button>
+          {navItems.slice(0, 2).map((item) => <NavItem active={view === item.id || (view === 'run' && item.id === 'dashboard')} count={item.id === 'dashboard' ? displayRuns.length : undefined} item={item} key={item.id} onNavigate={setView} />)}
+          <span className="nav-section-label nav-section-spaced">Configure</span>
+          {navItems.slice(2, 6).map((item) => <NavItem active={view === item.id} item={item} key={item.id} onNavigate={setView} />)}
         </nav>
-
         <div className="sidebar-bottom">
-          <div className="usage-card">
-            <div className="usage-heading">
-              <span>{apiMode ? 'Project runs' : 'Local suite'}</span>
-              <span className="usage-value">{apiMode ? displayRuns.length : '04'}</span>
-            </div>
-            <div aria-label={`${apiMode ? displayRuns.length : 4} available runs`} className="progress-track" role="progressbar">
-              <span className="progress-fill usage-fill" style={{ width: `${apiMode ? Math.min(100, displayRuns.length * 10) : 32}%` }} />
-            </div>
-            <span className="usage-footnote">{apiMode ? 'persisted API runs' : 'read-only demo fixtures'}</span>
-          </div>
+          <div className="sidebar-note"><span className="note-mark" /><span><strong>{apiMode ? 'Connected workspace' : 'Local-first preview'}</strong><small>{apiMode ? 'Protected API data' : 'Fixtures stay in your browser'}</small></span></div>
           <div className="user-row">
             <span className="user-avatar">{session ? session.user.email.slice(0, 2).toUpperCase() : 'DE'}</span>
-            <span className="user-copy">
-              <strong>{session?.user.email ?? 'Demo explorer'}</strong>
-              <span>{session ? 'Authenticated' : 'Offline mode'}</span>
-            </span>
-            {session ? <button aria-label="Sign out" className="icon-button subtle-icon" onClick={signOut} type="button"><Icon name="more" size={18} /></button> : <Icon name="more" size={18} />}
+            <span className="user-copy"><strong>{session?.user.email ?? 'Demo explorer'}</strong><span>{session ? 'Authenticated' : 'Offline mode'}</span></span>
+            {session ? <button aria-label="Sign out" className="icon-button subtle-icon" onClick={signOut} type="button"><Icon name="more" size={18} /></button> : <button aria-label="Sign in" className="icon-button subtle-icon" onClick={() => setAuthOpen(true)} type="button"><Icon name="arrow-up-right" size={16} /></button>}
           </div>
         </div>
       </aside>
 
       <div className="app-main">
         <header className="topbar">
-          <div className="breadcrumbs" aria-label="Breadcrumb">
-            <span>VerityBench</span>
-            <span className="breadcrumb-separator">/</span>
-            <strong>{viewLabels[view]}</strong>
-          </div>
+          <div className="breadcrumbs" aria-label="Breadcrumb"><span>VerityBench</span><span className="breadcrumb-separator">/</span><strong>{viewLabels[view]}</strong></div>
           <div className="topbar-actions">
-            <DemoPill apiStatus={apiStatus} apiMode={apiMode} />
-            <button aria-label="Search" className="search-button" type="button">
-              <Icon name="search" size={16} />
-              <span>Search</span>
-              <kbd>⌘ K</kbd>
-            </button>
-            <button aria-label="Open notifications" className="icon-button notification-button" type="button">
-              <Icon name="activity" size={18} />
-              <span className="notification-dot" />
-            </button>
-            <button aria-label={session ? `Sign out ${session.user.email}` : 'Sign in'} className="topbar-avatar profile-button" onClick={session ? signOut : () => setAuthOpen(true)} type="button">
-              {session ? session.user.email.slice(0, 2).toUpperCase() : 'SI'}
-            </button>
+            <SourceBadge apiMode={apiMode} apiStatus={apiStatus} />
+            <button aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`} className="theme-toggle" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} type="button"><Icon name={theme === 'light' ? 'moon' : 'sun'} size={16} /><span>{theme === 'light' ? 'Dark' : 'Light'}</span></button>
+            <button aria-label={session ? `Sign out ${session.user.email}` : 'Sign in'} className="topbar-avatar profile-button" onClick={session ? signOut : () => setAuthOpen(true)} type="button">{session ? session.user.email.slice(0, 2).toUpperCase() : 'SI'}</button>
           </div>
         </header>
 
         <main className="page-content">
-          <ProjectBar
-            apiStatus={apiStatus}
-            error={projectError}
-            loading={projectsLoading}
-            onCreate={createProject}
-            onOpenAuth={() => setAuthOpen(true)}
-            onSelect={selectProject}
-            projects={projects}
-            selectedProjectId={selectedProjectId}
-            session={session}
-          />
-          {demoBannerVisible && <div className={`demo-banner ${apiMode ? 'demo-banner-live' : ''}`}>
-            <Icon name={apiMode ? 'shield' : 'sparkles'} size={16} />
-            <span>
-              <strong>{apiMode ? 'Live persisted API data' : apiStatus === 'offline' ? 'Offline demo fallback' : 'Demo fallback · local fixtures'}</strong>
-              {' · '}
-              {apiMode ? 'Runs, metrics, reports, and evidence are loaded from the selected project.' : apiStatus === 'offline' ? 'The API is unreachable; browse repository-owned reports without writing data.' : 'Sign in to run against the API; local fixtures are read-only and never persisted.'}
-            </span>
-            <button aria-label="Dismiss demo data notice" className="banner-dismiss" onClick={() => setDemoBannerVisible(false)} type="button">×</button>
-          </div>}
-
+          <ProjectBar apiStatus={apiStatus} error={projectError} loading={projectsLoading} onCreate={createProject} onOpenAuth={() => setAuthOpen(true)} onSelect={selectProject} projects={projects} selectedProjectId={selectedProjectId} session={session} />
+          {noticeVisible && localSettings.showFixtureHints && <div className={`data-notice ${apiMode ? 'data-notice-live' : ''}`}><Icon name={apiMode ? 'shield' : 'layers'} size={16} /><span><strong>{apiMode ? 'Live project data' : apiStatus === 'offline' ? 'API unavailable · offline fallback' : 'Local fixture mode'}</strong>{' · '}{apiMode ? 'Runs, metrics, reports, and evidence are loaded from the selected project.' : 'Read-only fixtures are labeled throughout; no local action writes to the API.'}</span><button aria-label="Dismiss data source notice" className="notice-dismiss" onClick={() => setNoticeVisible(false)} type="button">×</button></div>}
           {runError && apiMode && <div className="inline-error" role="alert">{runError}</div>}
-          {view === 'overview' && <Overview apiData={apiMode} apiRuns={apiRuns} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} runs={displayRuns} stats={apiStats} trend={trend} />}
-          {view === 'dashboard' && <Dashboard apiData={apiMode} apiRuns={apiRuns} composerOpen={runComposerOpen} onCancelRun={() => setRunComposerOpen(false)} onOpenRun={openRun} onRun={requestRun} onSubmitRun={submitRun} runBusy={runBusy} runComposerError={runComposerError} runs={displayRuns} stats={apiStats} trend={trend} />}
+          {view === 'overview' && <Overview apiData={apiMode} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} runs={displayRuns} stats={stats} trend={trend} />}
+          {view === 'dashboard' && <Dashboard apiData={apiMode} apiRuns={apiRuns} composerOpen={runComposerOpen} compactRows={localSettings.compactRows} onCancelRun={() => setRunComposerOpen(false)} onOpenRun={openRun} onRun={requestRun} onSubmitRun={submitRun} runBusy={runBusy} runComposerError={runComposerError} runs={displayRuns} stats={stats} trend={trend} />}
           {view === 'run' && <RunDetail apiRun={apiMode ? selectedApiRun : null} loading={apiMode && runsLoading && !selectedApiRun} onBack={() => setView('dashboard')} run={selectedRun} />}
+          {view === 'datasets' && <DatasetsPage datasets={localDatasets} onAdd={(dataset) => setLocalDatasets((current) => [...current, dataset])} onSelect={setView} />}
+          {view === 'evaluators' && <EvaluatorsPage enabled={enabledEvaluators} onToggle={(id) => setEnabledEvaluators((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />}
+          {view === 'settings' && <SettingsPage apiStatus={apiStatus} enabledEvaluators={enabledEvaluators.length} localSettings={localSettings} onCheck={() => { setApiStatus('checking'); api.getHealth().then(() => setApiStatus('online')).catch(() => setApiStatus('offline')) }} onReset={resetLocalConfig} onSettingsChange={updateLocalSettings} onThemeChange={setTheme} session={session} theme={theme} />}
+          {view === 'cli' && <CliGuide />}
         </main>
       </div>
       {authOpen && <AuthPanel api={api} onClose={() => setAuthOpen(false)} onSignedIn={setSignedIn} />}
@@ -527,79 +521,20 @@ function Workspace() {
   )
 }
 
-function ProjectBar({
-  apiStatus,
-  error,
-  loading,
-  onCreate,
-  onOpenAuth,
-  onSelect,
-  projects,
-  selectedProjectId,
-  session,
-}: {
-  apiStatus: 'checking' | 'online' | 'offline'
-  error: string
-  loading: boolean
-  onCreate: (name: string, description: string) => Promise<void>
-  onOpenAuth: () => void
-  onSelect: (projectId: string) => void
-  projects: ApiProject[]
-  selectedProjectId: string | null
-  session: Session | null
-}) {
+function NavItem({ active, count, item, onNavigate }: { active: boolean; count?: number; item: typeof navItems[number]; onNavigate: (view: View) => void }) {
+  return <button aria-current={active ? 'page' : undefined} className={`nav-item ${active ? 'is-active' : ''}`} onClick={() => onNavigate(item.id)} type="button"><Icon name={item.icon} size={17} /><span className="nav-label">{item.label}</span>{count !== undefined && <span className="nav-count">{String(count).padStart(2, '0')}</span>}</button>
+}
+
+function ProjectBar({ apiStatus, error, loading, onCreate, onOpenAuth, onSelect, projects, selectedProjectId, session }: { apiStatus: ApiStatus; error: string; loading: boolean; onCreate: (name: string, description: string) => Promise<void>; onOpenAuth: () => void; onSelect: (projectId: string) => void; projects: ApiProject[]; selectedProjectId: string | null; session: Session | null }) {
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [busy, setBusy] = useState(false)
-
   const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    setBusy(true)
-    try {
-      await onCreate(name, description)
-      setName('')
-      setDescription('')
-      setCreating(false)
-    } catch {
-      // The parent keeps the API error visible in this bar.
-    } finally {
-      setBusy(false)
-    }
+    event.preventDefault(); setBusy(true)
+    try { await onCreate(name, description); setName(''); setDescription(''); setCreating(false) } catch { /* Parent shows the error. */ } finally { setBusy(false) }
   }
-
-  return (
-    <section className="project-bar" aria-label="Project workspace">
-      <div className="project-bar-copy">
-        <span className="section-kicker">Project workspace</span>
-        <strong>{session ? selectedProjectId ? 'Persisted evaluation project' : 'Choose a project to begin' : 'Sign in for persisted projects'}</strong>
-        <span>{session ? 'Runs are scoped to one authenticated project.' : 'The local demo remains available without an API session.'}</span>
-      </div>
-      {!session ? (
-        <button className="button button-secondary" onClick={onOpenAuth} type="button"><Icon name="shield" size={14} /> Sign in or register</button>
-      ) : creating ? (
-        <form className="project-create-form" onSubmit={submit}>
-          <input aria-label="Project name" onChange={(event) => setName(event.target.value)} placeholder="Project name" required value={name} />
-          <input aria-label="Project description" onChange={(event) => setDescription(event.target.value)} placeholder="Description (optional)" value={description} />
-          <button className="button button-primary" disabled={busy || apiStatus !== 'online'} type="submit">{busy ? 'Creating…' : 'Create'}</button>
-          <button className="button button-quiet" onClick={() => setCreating(false)} type="button">Cancel</button>
-        </form>
-      ) : (
-        <div className="project-bar-actions">
-          <label className="project-select-label">
-            <span className="sr-only">Selected project</span>
-            <select disabled={loading || !projects.length} onChange={(event) => onSelect(event.target.value)} value={selectedProjectId ?? ''}>
-              {!projects.length && <option value="">{loading ? 'Loading projects…' : 'No projects yet'}</option>}
-              {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-            </select>
-            <Icon name="chevron-down" size={14} />
-          </label>
-          <button className="button button-secondary" disabled={apiStatus !== 'online'} onClick={() => setCreating(true)} type="button"><Icon name="layers" size={14} /> New project</button>
-        </div>
-      )}
-      {error && <span className="project-error" role="alert">{error}</span>}
-    </section>
-  )
+  return <section aria-label="Project workspace" className="project-bar"><div className="project-bar-copy"><span className="section-kicker">Project context</span><strong>{session ? selectedProjectId ? 'Persisted evaluation project' : 'Choose a project to begin' : 'Browsing local fixtures'}</strong><span>{session ? 'Protected runs are scoped to the selected project.' : 'Sign in when you want to create and persist a run.'}</span></div>{!session ? <button className="button button-secondary" onClick={onOpenAuth} type="button"><Icon name="shield" size={14} /> Sign in for API access</button> : creating ? <form className="project-create-form" onSubmit={submit}><input aria-label="Project name" onChange={(event) => setName(event.target.value)} placeholder="Project name" required value={name} /><input aria-label="Project description" onChange={(event) => setDescription(event.target.value)} placeholder="Description (optional)" value={description} /><button className="button button-primary" disabled={busy || apiStatus !== 'online'} type="submit">{busy ? 'Creating…' : 'Create'}</button><button className="button button-quiet" onClick={() => setCreating(false)} type="button">Cancel</button></form> : <div className="project-bar-actions"><label className="project-select-label"><span className="sr-only">Selected project</span><select disabled={loading || !projects.length} onChange={(event) => onSelect(event.target.value)} value={selectedProjectId ?? ''}>{!projects.length && <option value="">{loading ? 'Loading projects…' : 'No projects yet'}</option>}{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><Icon name="chevron-down" size={14} /></label><button className="button button-secondary" disabled={apiStatus !== 'online'} onClick={() => setCreating(true)} type="button"><Icon name="file-plus" size={14} /> New project</button></div>}{error && <span className="project-error" role="alert">{error}</span>}</section>
 }
 
 function AuthPanel({ api, onClose, onSignedIn }: { api: ApiClient; onClose: () => void; onSignedIn: (session: Session) => void }) {
@@ -608,199 +543,155 @@ function AuthPanel({ api, onClose, onSignedIn }: { api: ApiClient; onClose: () =
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
-
   const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    setBusy(true)
-    setError('')
+    event.preventDefault(); setBusy(true); setError('')
     try {
       const result = mode === 'login' ? await api.login(email, password) : await api.register(email, password)
       onSignedIn({ token: result.access_token, user: result.user })
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : 'The API could not authenticate this account.')
-    } finally {
-      setBusy(false)
-    }
+    } finally { setBusy(false) }
   }
-
-  return (
-    <div className="auth-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section aria-labelledby="auth-title" aria-modal="true" className="auth-panel" role="dialog">
-        <button aria-label="Close authentication dialog" className="auth-close" onClick={onClose} type="button">×</button>
-        <span className="eyebrow"><Icon name="shield" size={14} /> Protected workspace</span>
-        <h2 id="auth-title">{mode === 'login' ? 'Sign in to VerityBench' : 'Create your workspace'}</h2>
-        <p className="auth-description">Protected projects and reports are authorized server-side. No credentials are sent to the sample agent.</p>
-        <form onSubmit={submit}>
-          <label>Email<input autoComplete="email" onChange={(event) => setEmail(event.target.value)} required type="email" value={email} /></label>
-          <label>Password<input autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} onChange={(event) => setPassword(event.target.value)} required type="password" value={password} /></label>
-          {error && <p className="auth-error" role="alert">{error}</p>}
-          <button className="button button-primary auth-submit" disabled={busy} type="submit">{busy ? 'Working…' : mode === 'login' ? 'Sign in' : 'Register'}</button>
-        </form>
-        <button className="auth-switch" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError('') }} type="button">{mode === 'login' ? 'Need an account? Register' : 'Already registered? Sign in'}</button>
-      </section>
-    </div>
-  )
+  return <div className="auth-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section aria-labelledby="auth-title" aria-modal="true" className="auth-panel" role="dialog"><button aria-label="Close authentication dialog" className="auth-close" onClick={onClose} type="button">×</button><span className="eyebrow"><Icon name="shield" size={14} /> Protected workspace</span><h2 id="auth-title">{mode === 'login' ? 'Sign in to VerityBench' : 'Create your workspace'}</h2><p className="auth-description">Projects and reports are authorized server-side. The sample agents never receive your credentials.</p><form onSubmit={submit}><label>Email<input autoComplete="email" onChange={(event) => setEmail(event.target.value)} required type="email" value={email} /></label><label>Password<input autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} onChange={(event) => setPassword(event.target.value)} required type="password" value={password} /></label>{error && <p className="auth-error" role="alert">{error}</p>}<button className="button button-primary auth-submit" disabled={busy} type="submit">{busy ? 'Working…' : mode === 'login' ? 'Sign in' : 'Register'}</button></form><button className="auth-switch" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError('') }} type="button">{mode === 'login' ? 'Need an account? Register' : 'Already registered? Sign in'}</button></section></div>
 }
 
-function PageIntro({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) {
-  return (
-    <div className="page-intro">
-      <div>
-        <span className="eyebrow"><span className="eyebrow-line" />{eyebrow}</span>
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </div>
-      {action}
-    </div>
-  )
+function PageIntro({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
+  return <div className="page-intro"><div><span className="eyebrow"><span className="eyebrow-line" />{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>
 }
 
-function Overview({ apiData, apiRuns, coverage, onNavigate, onOpenRun, onRun, runs, stats, trend }: { apiData: boolean; apiRuns: ApiRun[]; coverage: CoverageItem[]; onNavigate: (view: View) => void; onOpenRun: (id: string) => void; onRun: () => void; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
-  return (
-    <>
-      <section className="hero-grid">
-        <div className="hero-copy">
-          <span className="eyebrow"><Icon name="sparkles" size={14} /> Agent reliability workspace</span>
-          <h1>Test agents. <span>Trust the evidence.</span></h1>
-          <p>Exercise agent workflows against controlled failures, then verify observable outcomes instead of trusting the agent's success claim.</p>
-          <div className="hero-actions">
-            <button className="button button-primary" onClick={() => onNavigate('dashboard')} type="button">Explore runs <Icon name="arrow-right" size={16} /></button>
-            <button className="button button-secondary" disabled={!runs.length} onClick={() => runs.length && onOpenRun(runs[0].id)} type="button"><Icon name="play" size={14} /> Open latest run</button>
-          </div>
-          <div className="hero-meta">
-            <span><Icon name="check" size={14} /> deterministic sample suite</span>
-            <span><Icon name="shield" size={14} /> independent ledger checks</span>
-          </div>
-        </div>
-        <PulseCard apiData={apiData} runs={runs} stats={stats} trend={trend} />
-      </section>
-
-      <div className="section-heading overview-heading">
-        <div><span className="section-kicker">At a glance</span><h2>Signal, without the noise</h2></div>
-        <button className="text-button" onClick={() => onNavigate('dashboard')} type="button">View full dashboard <Icon name="arrow-up-right" size={15} /></button>
-      </div>
-
-      <div className="metric-grid">
-        <MetricCard label="Evaluation pass rate" value={stats.passRate} change={stats.passCount} detail={apiData ? 'persisted report evaluations' : 'local sample scenarios'} icon="gauge" tone="cyan" />
-        <MetricCard label="Recorded traces" value={stats.traceCount} change={apiData ? 'report-derived' : 'actual'} detail={apiData ? 'events in selected project' : 'events across demo runs'} icon="layers" tone="violet" />
-        <MetricCard label="Duplicate charges" value={stats.duplicateCharges} change={apiData ? 'report-derived' : 'blocked'} detail={apiData ? 'from persisted report metrics' : 'independent evaluator finding'} icon="shield" tone="green" />
-      </div>
-
-      <div className="overview-columns">
-        <RecentRuns apiData={apiData} onOpenRun={onOpenRun} runs={runs} />
-        <CoveragePanel apiData={apiData} items={coverage} />
-      </div>
-
-      <section className="insight-strip">
-        <div className="insight-icon"><Icon name="trend-up" size={19} /></div>
-        <div>
-          <span className="section-kicker">Evidence insight</span>
-          <h3>{apiData ? 'Run the sample agent to create a persisted report.' : 'The defective agent created two charges after a lost response.'}</h3>
-          <p>{apiData ? 'Choose safe or defective behavior and inspect the stored ledger and trace after execution.' : 'Open the failed fixture to inspect ledger entries and the idempotency recommendation.'}</p>
-        </div>
-        <button className="text-button" onClick={apiData ? onRun : () => runs.length && onOpenRun(runs[0].id)} type="button">{apiData ? 'Run sample agent' : 'Inspect evidence'} <Icon name="arrow-right" size={15} /></button>
-      </section>
-      {apiData && apiRuns.length === 0 && <EmptyState title="No persisted runs yet" description="Start a safe or defective sample agent run from the dashboard." actionLabel="Open run controls" onAction={onRun} />}
-    </>
-  )
+function Overview({ apiData, coverage, onNavigate, onOpenRun, onRun, runs, stats, trend }: { apiData: boolean; coverage: CoverageItem[]; onNavigate: (view: View) => void; onOpenRun: (id: string) => void; onRun: () => void; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
+  const latest = runs[0]
+  return <>
+    <PageIntro eyebrow="Evidence-first evaluation" title="Know what your agent actually did." description="Run controlled scenarios, inspect the trace and ledger, and keep reliability claims tied to observable evidence." action={<button className="button button-primary" onClick={onRun} type="button"><Icon name="play" size={14} /> {apiData ? 'Start a run' : 'View sample run'}</button>} />
+    <section className="overview-hero"><div className="hero-copy"><div className="hero-chip"><span className="hero-chip-dot" />{apiData ? 'Selected project signal' : 'Read-only fixture snapshot'}</div><h2>{apiData ? 'Your project, in plain view.' : 'A reliable workflow starts with a falsifiable report.'}</h2><p>{apiData ? 'The summary below is calculated from persisted API reports. Open any run to see the exact invariant evidence behind the score.' : 'The local sample shows the same inspection path without pretending to be backend data. Sign in to create a project and persist new runs.'}</p><div className="hero-links"><button className="text-button" onClick={() => onNavigate('dashboard')} type="button">Browse agent runs <Icon name="arrow-right" size={15} /></button><button className="text-button text-button-muted" onClick={() => onNavigate('cli')} type="button">Use the API guide <Icon name="arrow-up-right" size={15} /></button></div></div><PulseSummary apiData={apiData} latest={latest} stats={stats} trend={trend} /></section>
+    <div className="section-heading"><div><span className="section-kicker">At a glance</span><h2>Signals from the current source</h2></div><span className="muted-label">{apiData ? 'Derived from persisted reports' : 'Derived from local fixtures'}</span></div>
+    <div className="metric-grid"><MetricCard label="Evaluation pass rate" value={stats.passRate} detail={stats.evaluated} icon="gauge" tone="accent" /><MetricCard label="Recorded traces" value={stats.traceCount} detail={apiData ? 'Events in persisted reports' : 'Events in fixture runs'} icon="activity" tone="violet" /><MetricCard label="Duplicate charges" value={stats.duplicateCharges} detail={apiData ? 'Report metric total' : 'Not in fixture metadata'} icon="shield" tone="green" /></div>
+    <div className="overview-columns"><RecentRuns apiData={apiData} onOpenRun={onOpenRun} runs={runs} /><CoveragePanel apiData={apiData} items={coverage} /></div>
+    <section className="insight-strip"><span className="insight-icon"><Icon name={apiData ? 'shield' : 'layers'} size={18} /></span><div><span className="section-kicker">Next useful step</span><h3>{apiData ? latest ? 'Inspect the latest persisted report.' : 'Create the first persisted report.' : 'Inspect how evidence catches the defect.'}</h3><p>{apiData ? latest ? 'Open the run detail to review invariants, findings, ledger entries, and trace events.' : 'Choose a sample agent and scenario from Agent runs.' : 'The local defective fixture includes a duplicate-charge signal and its evidence.'}</p></div><button className="text-button" onClick={apiData ? latest ? () => onOpenRun(latest.id) : onRun : () => runs[2] && onOpenRun(runs[2].id)} type="button">{apiData ? latest ? 'Open report' : 'Run sample agent' : 'Open evidence'} <Icon name="arrow-right" size={15} /></button></section>
+  </>
 }
 
-function PulseCard({ apiData, runs, stats, trend }: { apiData: boolean; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
-  const chart = trend.length ? trend : demoTrend
-  const points = chart.map((point, index) => `${(index / Math.max(1, chart.length - 1)) * 440},${104 - point.value * 0.9}`).join(' ')
-  const latest = apiData ? stats.passRate : '100%'
-  return (
-    <div className="pulse-card">
-      <div className="pulse-orbit orbit-one" /><div className="pulse-orbit orbit-two" />
-      <div className="pulse-card-top"><span className="card-label"><span className="live-dot" /> {apiData ? 'Persisted evaluation pulse' : 'Reliability pulse'}</span><button aria-label="Pulse card options" className="icon-button subtle-icon" type="button"><Icon name="more" size={18} /></button></div>
-      <div className="pulse-score">{latest.replace('%', '')}<span>{latest === '—' ? '' : '%'}</span></div>
-      <div className="pulse-score-label">{apiData ? `${runs.length} report${runs.length === 1 ? '' : 's'} in selected project` : 'Safe timeout recovery verified'}</div>
-      <div className="pulse-chart" aria-label="Evaluation trend" role="img"><svg preserveAspectRatio="none" viewBox="0 0 440 112"><defs><linearGradient id="pulse-gradient" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#63e6d5" stopOpacity=".26" /><stop offset="100%" stopColor="#63e6d5" stopOpacity="0" /></linearGradient></defs><polyline fill="url(#pulse-gradient)" points={`0,112 ${points} 440,112`} /><polyline fill="none" points={points} stroke="#63e6d5" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" /></svg></div>
-      <div className="pulse-footer"><span><Icon name="check" size={14} /> {apiData ? 'derived from reports' : 'ledger verified'}</span><span>{apiData ? 'selected project' : 'deterministic run'}</span></div>
-    </div>
-  )
+function PulseSummary({ apiData, latest, stats, trend }: { apiData: boolean; latest?: Run; stats: DashboardStats; trend: TrendPoint[] }) {
+  const lastPoint = trend[trend.length - 1]
+  return <section className="pulse-summary"><div className="pulse-header"><span className="card-label"><span className="live-dot" />{apiData ? 'Persisted project score' : 'Fixture score'}</span><span className="muted-label">{trend.length ? `${trend.length} points` : 'No report score'}</span></div><strong className="pulse-number">{lastPoint ? lastPoint.value : stats.passRate === '—' ? '—' : stats.passRate.replace('%', '')}<small>{lastPoint || stats.passRate !== '—' ? '%' : ''}</small></strong><span className="pulse-label">{latest ? `${latest.name} · ${latest.dataset}` : apiData ? 'No persisted run selected' : 'Local deterministic snapshot'}</span><MiniTrend points={trend} /><div className="pulse-footer"><span><Icon name="check" size={13} /> Score only, no invented baseline</span><span>{apiData ? 'API report history' : 'Fixture history'}</span></div></section>
 }
 
-function MetricCard({ label, value, change, detail, icon, tone }: { label: string; value: string; change: string; detail: string; icon: IconName; tone: string }) {
-  return <div className="metric-card"><div className={`metric-icon metric-icon-${tone}`}><Icon name={icon} size={18} /></div><div className="metric-label">{label}</div><div className="metric-value-row"><strong>{value}</strong><span className="metric-change">{change}</span></div><div className="metric-detail">{detail}</div></div>
+function MiniTrend({ points }: { points: TrendPoint[] }) {
+  if (!points.length) return <div className="mini-trend-empty">Run a scenario to plot report scores.</div>
+  const coordinates = points.map((point, index) => `${(index / Math.max(1, points.length - 1)) * 100},${100 - point.value}`).join(' ')
+  return <div aria-label="Report score trend" className="mini-trend" role="img"><svg preserveAspectRatio="none" viewBox="0 0 100 100"><line x1="0" x2="100" y1="25" y2="25" /><line x1="0" x2="100" y1="50" y2="50" /><line x1="0" x2="100" y1="75" y2="75" /><polyline points={coordinates} /></svg></div>
+}
+
+function MetricCard({ label, value, detail, icon, tone }: { label: string; value: string; detail: string; icon: IconName; tone: string }) {
+  return <article className="metric-card"><div className={`metric-icon metric-icon-${tone}`}><Icon name={icon} size={18} /></div><span className="metric-label">{label}</span><strong className="metric-value">{value}</strong><span className="metric-detail">{detail}</span></article>
 }
 
 function RecentRuns({ apiData, onOpenRun, runs }: { apiData: boolean; onOpenRun: (id: string) => void; runs: Run[] }) {
-  return <section className="panel recent-panel"><div className="panel-heading"><div><span className="section-kicker">Activity</span><h2>{apiData ? 'Persisted runs' : 'Recent demo runs'}</h2></div>{runs[0] && <button aria-label="Open latest run" className="icon-button subtle-icon" onClick={() => onOpenRun(runs[0].id)} type="button"><Icon name="arrow-up-right" size={17} /></button>}</div><div className="run-list">{runs.length ? runs.slice(0, 3).map((run) => <RunRow key={run.id} run={run} onOpen={onOpenRun} />) : <EmptyPanel description="No persisted reports are available for this project yet." />}</div><button className="panel-footer-button" onClick={() => runs.length && onOpenRun(runs[0].id)} type="button">See all evaluation runs <Icon name="arrow-right" size={15} /></button></section>
+  return <section className="panel recent-panel"><div className="panel-heading"><div><span className="section-kicker">Activity</span><h2>{apiData ? 'Persisted runs' : 'Fixture runs'}</h2></div><span className="muted-label">{runs.length} total</span></div><div className="run-list">{runs.length ? runs.slice(0, 4).map((run) => <RunRow key={run.id} onOpen={onOpenRun} run={run} />) : <EmptyPanel description="No persisted reports are available for this project yet." />}</div><button className="panel-footer-button" onClick={() => runs.length && onOpenRun(runs[0].id)} type="button">Open run history <Icon name="arrow-right" size={15} /></button></section>
 }
 
-function RunRow({ run, onOpen }: { run: Run; onOpen: (id: string) => void }) {
-  return <button className={`run-row ${run.status === 'needs-review' ? 'run-row-needs-review' : ''}`} onClick={() => onOpen(run.id)} type="button"><span className="run-type-icon"><Icon name={run.status === 'needs-review' ? 'warning' : 'activity'} size={16} /></span><span className="run-row-copy"><strong>{run.name}</strong><span>{run.id} · {run.model}</span></span><span className="run-row-score"><strong>{formatScore(run.score)}</strong><span className={run.scoreDelta !== null && run.scoreDelta >= 0 ? 'positive' : run.scoreDelta !== null ? 'negative' : ''}>{run.scoreDelta === null ? 'report-derived' : `${run.scoreDelta >= 0 ? '+' : ''}${run.scoreDelta}%`}</span></span><Icon name="chevron-right" size={16} className="row-chevron" /></button>
+function RunRow({ onOpen, run }: { onOpen: (id: string) => void; run: Run }) {
+  return <button className={`run-row ${run.status === 'needs-review' ? 'run-row-needs-review' : ''}`} onClick={() => onOpen(run.id)} type="button"><span className="run-type-icon"><Icon name={run.status === 'needs-review' ? 'warning' : 'activity'} size={16} /></span><span className="run-row-copy"><strong>{run.name}</strong><span>{run.id} · {run.dataset}</span></span><span className="run-row-score"><strong>{formatScore(run.score)}</strong><span>{run.score === null ? 'no report' : `${run.passedCases}/${run.cases} ${run.caseLabel ?? 'cases'}`}</span></span><Icon name="chevron-right" size={16} className="row-chevron" /></button>
 }
 
 function CoveragePanel({ apiData, items }: { apiData: boolean; items: CoverageItem[] }) {
-  return <section className="panel coverage-panel"><div className="panel-heading"><div><span className="section-kicker">Evaluator coverage</span><h2>{apiData ? 'Persisted invariant signals' : 'Where confidence lives'}</h2></div><button aria-label="Coverage options" className="icon-button subtle-icon" type="button"><Icon name="more" size={17} /></button></div><div className="coverage-list">{items.length ? items.map((item) => <CoverageBar item={item} key={item.label} />) : <EmptyPanel description="Coverage appears after the first persisted report." />}</div><div className="coverage-note"><Icon name="shield" size={15} /> <span>{apiData ? 'Values are derived from report evaluation invariants.' : 'All signals are from deterministic local fixtures.'}</span></div></section>
+  return <section className="panel coverage-panel"><div className="panel-heading"><div><span className="section-kicker">Evaluator coverage</span><h2>{apiData ? 'Persisted invariant signals' : 'Fixture invariant signals'}</h2></div><span className="muted-label">{items.length} signals</span></div><div className="coverage-list">{items.length ? items.map((item) => <CoverageBar item={item} key={item.label} />) : <EmptyPanel description="Coverage appears after the first persisted report." />}</div><div className="coverage-note"><Icon name="shield" size={15} /><span>{apiData ? 'Grouped from report.evaluation.invariants.' : 'Read-only values from repository-owned fixtures.'}</span></div></section>
 }
 
 function CoverageBar({ item }: { item: CoverageItem }) {
   return <div className="coverage-row"><div className="coverage-label"><span>{item.label}</span><strong>{item.value}%</strong></div><div aria-label={`${item.label}: ${item.value} percent`} aria-valuemax={100} aria-valuemin={0} aria-valuenow={item.value} className="progress-track" role="progressbar"><span className={`progress-fill fill-${item.color}`} style={{ width: `${item.value}%` }} /></div></div>
 }
 
-function Dashboard({ apiData, apiRuns, composerOpen, onCancelRun, onOpenRun, onRun, onSubmitRun, runBusy, runComposerError, runs, stats, trend }: { apiData: boolean; apiRuns: ApiRun[]; composerOpen: boolean; onCancelRun: () => void; onOpenRun: (id: string) => void; onRun: () => void; onSubmitRun: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void>; runBusy: boolean; runComposerError: string; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
-  return <><PageIntro eyebrow="Agent reliability workspace" title="Agent runs" description="Replay controlled scenarios and inspect the evidence behind every outcome." action={<button className="button button-primary" onClick={onRun} type="button"><Icon name="play" size={14} /> Run sample agent</button>} />{composerOpen && <RunComposer busy={runBusy} error={runComposerError} onCancel={onCancelRun} onSubmit={onSubmitRun} />}
-    <div className="metric-grid dashboard-metrics"><MetricCard label="Evaluation pass rate" value={apiData ? stats.passRate : '75%'} change={apiData ? stats.passCount : '3 / 4'} detail={apiData ? 'persisted report evaluations' : 'local sample scenarios'} icon="gauge" tone="cyan" /><MetricCard label="Recorded traces" value={apiData ? stats.traceCount : '30'} change={apiData ? 'report-derived' : 'actual'} detail={apiData ? 'events in selected project' : 'events across demo runs'} icon="activity" tone="violet" /><MetricCard label="Duplicate charges" value={apiData ? stats.duplicateCharges : '01'} change={apiData ? 'report-derived' : 'blocked'} detail={apiData ? 'from persisted report metrics' : 'independent evaluator finding'} icon="warning" tone="amber" /><MetricCard label="Safe retests" value={apiData ? stats.safeRetests : '03'} change={apiData ? 'report-derived' : 'passed'} detail={apiData ? 'passed safe reports' : 'with ledger evidence'} icon="check" tone="green" /></div>
-    <div className="dashboard-grid"><TrendPanel apiData={apiData} points={trend} /><ModelPanel apiData={apiData} runs={apiRuns} /></div>
-    <section className="panel runs-table-panel"><div className="panel-heading table-heading"><div><span className="section-kicker">{apiData ? 'Authenticated project' : 'Deterministic sample suite'}</span><h2>{apiData ? 'Persisted agent runs' : 'All demo runs'}</h2></div><div className="table-actions"><span className="muted-label">{runs.length} {apiData ? 'loaded' : 'fixtures'}</span></div></div><div className="runs-table-wrap"><table className="runs-table"><thead><tr><th>Run</th><th>Agent</th><th>Scenario</th><th>Status</th><th>Report score</th><th>Completed</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{runs.length ? runs.map((run) => <tr key={run.id} onClick={() => onOpenRun(run.id)}><td><button className="table-run-name" onClick={(event) => { event.stopPropagation(); onOpenRun(run.id) }} type="button"><span className="table-run-icon"><Icon name="activity" size={14} /></span><span><strong>{run.name}</strong><small>{run.id}</small></span></button></td><td>{run.model}<small>{run.modelVersion}</small></td><td>{run.dataset}</td><td><StatusBadge status={run.status} /></td><td><strong className="table-score">{formatScore(run.score)}</strong><small>{run.scoreDelta === null ? 'derived from report' : `${run.scoreDelta >= 0 ? '+' : ''}${run.scoreDelta}% vs. prior`}</small></td><td className="muted-cell">{run.completedAt}</td><td><button aria-label={`Open ${run.name}`} className="icon-button subtle-icon" onClick={(event) => { event.stopPropagation(); onOpenRun(run.id) }} type="button"><Icon name="chevron-right" size={16} /></button></td></tr>) : <tr><td className="table-empty" colSpan={7}><EmptyPanel description={apiData ? 'No persisted runs in this project yet.' : 'Demo fixtures are unavailable.'} /></td></tr>}</tbody></table></div></section>
-  </>
+function Dashboard({ apiData, apiRuns, composerOpen, compactRows, onCancelRun, onOpenRun, onRun, onSubmitRun, runBusy, runComposerError, runs, stats, trend }: { apiData: boolean; apiRuns: ApiRun[]; composerOpen: boolean; compactRows: boolean; onCancelRun: () => void; onOpenRun: (id: string) => void; onRun: () => void; onSubmitRun: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void>; runBusy: boolean; runComposerError: string; runs: Run[]; stats: DashboardStats; trend: TrendPoint[] }) {
+  const [filter, setFilter] = useState<'all' | Run['status']>('all')
+  const [query, setQuery] = useState('')
+  const filteredRuns = runs.filter((run) => (filter === 'all' || run.status === filter) && `${run.name} ${run.dataset} ${run.id}`.toLowerCase().includes(query.toLowerCase()))
+  return <><PageIntro eyebrow="Evaluation history" title="Agent runs" description="Replay controlled scenarios and inspect the evidence behind every outcome." action={<button className="button button-primary" onClick={onRun} type="button"><Icon name="play" size={14} /> Run sample agent</button>} />{composerOpen && <RunComposer busy={runBusy} error={runComposerError} onCancel={onCancelRun} onSubmit={onSubmitRun} />}<div className="metric-grid dashboard-metrics"><MetricCard label="Evaluation pass rate" value={stats.passRate} detail={stats.evaluated} icon="gauge" tone="accent" /><MetricCard label="Recorded traces" value={stats.traceCount} detail={apiData ? 'From persisted reports' : 'From fixtures'} icon="activity" tone="violet" /><MetricCard label="Duplicate charges" value={stats.duplicateCharges} detail={apiData ? 'Report metric total' : 'Not in fixture metadata'} icon="warning" tone="amber" /><MetricCard label="Safe retests" value={stats.safeRetests} detail={apiData ? 'Passed safe reports' : 'Fixture runs'} icon="check" tone="green" /></div><div className="dashboard-grid"><TrendPanel apiData={apiData} points={trend} /><AgentComparison apiData={apiData} runs={apiRuns} /></div><section className="panel runs-table-panel"><div className="panel-heading table-heading"><div><span className="section-kicker">{apiData ? 'Authenticated project' : 'Deterministic sample suite'}</span><h2>{apiData ? 'Persisted agent runs' : 'Fixture run history'}</h2></div><span className="muted-label">{filteredRuns.length} of {runs.length}</span></div><div className="table-toolbar"><label className="search-field"><Icon name="search" size={15} /><span className="sr-only">Filter runs</span><input onChange={(event) => setQuery(event.target.value)} placeholder="Filter by run, dataset, or id" value={query} /></label><div className="filter-group" aria-label="Run status filter">{(['all', 'completed', 'needs-review', 'running'] as const).map((value) => <button className={filter === value ? 'filter-active' : ''} key={value} onClick={() => setFilter(value)} type="button">{value === 'all' ? 'All' : value === 'needs-review' ? 'Needs review' : value === 'completed' ? 'Passed' : 'Running'}</button>)}</div></div><div className="runs-table-wrap"><table className="runs-table"><thead><tr><th>Run</th><th>Agent</th><th>Scenario</th><th>Status</th><th>Score</th><th>Completed</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>{filteredRuns.length ? filteredRuns.map((run) => <tr className={compactRows ? 'compact-row' : ''} key={run.id} onClick={() => onOpenRun(run.id)}><td><button className="table-run-name" onClick={(event) => { event.stopPropagation(); onOpenRun(run.id) }} type="button"><span className="table-run-icon"><Icon name="activity" size={14} /></span><span><strong>{run.name}</strong><small>{run.id}</small></span></button></td><td>{run.model}<small>{run.modelVersion}</small></td><td>{run.dataset}</td><td><StatusBadge status={run.status} /></td><td><strong className="table-score">{formatScore(run.score)}</strong><small>{run.score === null ? 'report unavailable' : `${run.passedCases}/${run.cases} ${run.caseLabel ?? 'cases'}`}</small></td><td className="muted-cell">{run.completedAt}</td><td><button aria-label={`Open ${run.name}`} className="icon-button subtle-icon" onClick={(event) => { event.stopPropagation(); onOpenRun(run.id) }} type="button"><Icon name="chevron-right" size={16} /></button></td></tr>) : <tr><td className="table-empty" colSpan={7}><EmptyPanel description={apiData ? 'No persisted runs match this filter.' : 'No local fixtures match this filter.'} /></td></tr>}</tbody></table></div></section></>
 }
 
 function RunComposer({ busy, error, onCancel, onSubmit }: { busy: boolean; error: string; onCancel: () => void; onSubmit: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void> }) {
   const [agent, setAgent] = useState<SupportedAgent>('safe')
   const [scenario, setScenario] = useState<SupportedScenario>('normal')
   const selectedScenario = scenarios.find((item) => item.value === scenario)
-  const submit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    void onSubmit(agent, scenario)
-  }
-  return <section className="panel run-composer"><div className="panel-heading"><div><span className="section-kicker">Protected sample execution</span><h2>Configure a persisted run</h2></div><button aria-label="Close run controls" className="icon-button subtle-icon" onClick={onCancel} type="button">×</button></div><p className="composer-description">Only the repository-owned safe and defective sample agents can execute. The selected scenario is persisted with its evidence report.</p><form className="composer-form" onSubmit={submit}><label>Agent<select onChange={(event) => setAgent(event.target.value as SupportedAgent)} value={agent}><option value="safe">safe-sample-agent · reconciles uncertainty</option><option value="defective">defective-sample-agent · demonstrates duplicate charge</option></select></label><label>Scenario<select onChange={(event) => setScenario(event.target.value as SupportedScenario)} value={scenario}>{scenarios.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><span className="field-help">{selectedScenario?.description}</span></label><div className="composer-actions"><button className="button button-primary" disabled={busy} type="submit"><Icon name="play" size={14} /> {busy ? 'Running…' : 'Run and persist report'}</button><button className="button button-quiet" onClick={onCancel} type="button">Cancel</button></div></form>{error && <p className="auth-error" role="alert">{error}</p>}</section>
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void onSubmit(agent, scenario) }
+  return <section className="panel run-composer"><div className="panel-heading"><div><span className="section-kicker">Protected sample execution</span><h2>Configure a persisted run</h2></div><button aria-label="Close run controls" className="icon-button subtle-icon" onClick={onCancel} type="button">×</button></div><p className="composer-description">Only the repository-owned sample agents can execute. The selected scenario and evidence report are persisted to the chosen project.</p><form className="composer-form" onSubmit={submit}><label>Agent<select onChange={(event) => setAgent(event.target.value as SupportedAgent)} value={agent}><option value="safe">safe-sample-agent · reconciles uncertainty</option><option value="defective">defective-sample-agent · demonstrates duplicate charge</option></select></label><label>Scenario<select onChange={(event) => setScenario(event.target.value as SupportedScenario)} value={scenario}>{scenarios.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><span className="field-help">{selectedScenario?.description}</span></label><div className="composer-actions"><button className="button button-primary" disabled={busy} type="submit"><Icon name="play" size={14} /> {busy ? 'Running…' : 'Run and persist report'}</button><button className="button button-quiet" onClick={onCancel} type="button">Cancel</button></div></form>{error && <p className="auth-error" role="alert">{error}</p>}</section>
 }
 
 function TrendPanel({ apiData, points }: { apiData: boolean; points: TrendPoint[] }) {
-  const chartPoints = points.length ? points : apiData ? [] : demoTrend
-  const coordinates = chartPoints.map((point, index) => `${(index / Math.max(1, chartPoints.length - 1)) * 100},${104 - point.value}`).join(' ')
-  return <section className="panel trend-panel"><div className="panel-heading"><div><span className="section-kicker">{apiData ? 'Persisted report history' : 'Quality over time'}</span><h2>{apiData ? 'Evaluation history' : 'Score trend'}</h2></div><span className="chart-period">{apiData ? `${chartPoints.length} reports` : 'Local suite'} <Icon name="chevron-down" size={14} /></span></div>{chartPoints.length ? <><div className="trend-summary"><strong>{formatScore(chartPoints[chartPoints.length - 1].value)}</strong><span className="positive"><Icon name="trend-up" size={14} /> {apiData ? 'latest report-derived score' : 'safe paths pass'}</span></div><div className="trend-chart"><div className="chart-y-labels"><span>100</span><span>75</span><span>50</span><span>0</span></div><svg preserveAspectRatio="none" viewBox="0 0 100 104" aria-label="Evaluation score trend" role="img"><defs><linearGradient id="trend-gradient" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#7a8cff" stopOpacity=".22" /><stop offset="100%" stopColor="#7a8cff" stopOpacity="0" /></linearGradient></defs><polygon fill="url(#trend-gradient)" points={`0,104 ${coordinates} 100,104`} /><polyline fill="none" points={coordinates} stroke="#8b9aff" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.4" /></svg></div><div className="chart-x-labels">{chartPoints.map((point) => <span key={point.label}>{point.label}</span>)}</div></> : <EmptyPanel description="Run a sample agent to build persisted evaluation history." />}</section>
+  return <section className="panel trend-panel"><div className="panel-heading"><div><span className="section-kicker">{apiData ? 'Persisted report history' : 'Fixture history'}</span><h2>Score trend</h2></div><span className="muted-label">{points.length ? `${points.length} scored runs` : 'No scored runs'}</span></div><ScoreChart points={points} /></section>
 }
 
-function ModelPanel({ apiData, runs }: { apiData: boolean; runs: ApiRun[] }) {
-  const models = apiData ? Array.from(new Set(runs.map((run) => run.report?.agent_name ?? `${run.agent}-sample-agent`))).map((name) => {
-    const modelRuns = runs.filter((run) => (run.report?.agent_name ?? `${run.agent}-sample-agent`) === name)
-    const scores = modelRuns.map((run) => runScore(run.report)).filter((score): score is number => score !== null)
-    return { name, score: scores.length ? Math.round(scores.reduce((total, score) => total + score, 0) / scores.length) : null, cases: `${modelRuns.length} persisted run${modelRuns.length === 1 ? '' : 's'}`, color: name.includes('defective') ? 'amber' : 'cyan' }
-  }) : [{ name: 'safe-sample-agent', score: 100, cases: '3 safe paths', color: 'cyan' }, { name: 'defective-sample-agent', score: 0, cases: '1 defect path', color: 'amber' }]
-  return <section className="panel model-panel"><div className="panel-heading"><div><span className="section-kicker">Agent comparison</span><h2>{apiData ? 'By persisted report' : 'By integration'}</h2></div><button aria-label="Agent comparison options" className="icon-button subtle-icon" type="button"><Icon name="more" size={17} /></button></div><div className="model-list">{models.length ? models.map((model) => <div className="model-row" key={model.name}><span className={`model-bullet bullet-${model.color}`} /><span className="model-name"><strong>{model.name}</strong><small>{model.cases}</small></span><span className="model-score"><strong>{formatScore(model.score)}</strong><span className="mini-track"><span className={`mini-fill fill-${model.color}`} style={{ width: `${model.score ?? 0}%` }} /></span></span></div>) : <EmptyPanel description="No persisted reports to compare." />}</div><div className="model-footer"><span><span className="legend-dot dot-cyan" /> {apiData ? 'Average derived from reports' : 'Best performing'}</span><span>{apiData ? 'selected project' : 'Local demo snapshot'}</span></div></section>
+function ScoreChart({ points }: { points: TrendPoint[] }) {
+  if (!points.length) return <EmptyPanel description="Run a sample agent to build persisted evaluation history." />
+  const coordinates = points.map((point, index) => `${(index / Math.max(1, points.length - 1)) * 100},${100 - point.value}`).join(' ')
+  return <><div className="chart-legend"><span><i className="legend-line" /> Report score</span><span>0–100 scale</span></div><div aria-label="Evaluation score trend" className="score-chart" role="img"><div className="chart-y-labels"><span>100</span><span>75</span><span>50</span><span>25</span><span>0</span></div><svg preserveAspectRatio="none" viewBox="0 0 100 100"><line x1="0" x2="100" y1="0" y2="0" /><line x1="0" x2="100" y1="25" y2="25" /><line x1="0" x2="100" y1="50" y2="50" /><line x1="0" x2="100" y1="75" y2="75" /><line x1="0" x2="100" y1="100" y2="100" /><polyline points={coordinates} /></svg></div><div className="chart-x-labels">{points.map((point) => <span key={point.label}>{point.label}</span>)}</div></>
+}
+
+function AgentComparison({ apiData, runs }: { apiData: boolean; runs: ApiRun[] }) {
+  const sourceRuns = apiData ? runs.map(apiRunToView) : demoRuns
+  const models = Array.from(new Set(sourceRuns.map((run) => run.model))).map((name) => {
+    const modelRuns = sourceRuns.filter((run) => run.model === name)
+    const scores = modelRuns.map((run) => run.score).filter((score): score is number => score !== null)
+    return { name, score: scores.length ? Math.round(scores.reduce((total, score) => total + score, 0) / scores.length) : null, count: modelRuns.length, color: name.includes('defective') ? 'amber' : 'accent' }
+  })
+  return <section className="panel comparison-panel"><div className="panel-heading"><div><span className="section-kicker">Agent comparison</span><h2>{apiData ? 'By persisted report' : 'By fixture run'}</h2></div><span className="muted-label">Average score</span></div><div className="comparison-list">{models.length ? models.map((model) => <div className="comparison-row" key={model.name}><span className={`model-bullet bullet-${model.color}`} /><span className="model-name"><strong>{model.name}</strong><small>{model.count} {model.count === 1 ? 'run' : 'runs'}</small></span><span className="model-score"><strong>{formatScore(model.score)}</strong><span className="mini-track"><span className={`mini-fill fill-${model.color}`} style={{ width: `${model.score ?? 0}%` }} /></span></span></div>) : <EmptyPanel description="No persisted reports to compare." />}</div><p className="panel-footnote">{apiData ? 'Averages are calculated from report evaluation invariants.' : 'Fixture comparison is read-only and not a backend claim.'}</p></section>
 }
 
 function RunDetail({ apiRun, loading, onBack, run }: { apiRun: ApiRun | null; loading: boolean; onBack: () => void; run: Run | null }) {
   if (apiRun) return <ApiRunDetail apiRun={apiRun} onBack={onBack} />
-  if (loading) return <><button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" size={16} /> Back to runs</button><div className="detail-loading">Loading persisted report…</div></>
-  if (!run) return <><button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" size={16} /> Back to runs</button><EmptyState title="Run not found" description="This run is not available in the selected project." actionLabel="Back to runs" onAction={onBack} /></>
+  if (loading) return <><BackButton onBack={onBack} /><div className="detail-loading">Loading persisted report…</div></>
+  if (!run) return <><BackButton onBack={onBack} /><EmptyState title="Run not found" description="This run is not available in the selected project." actionLabel="Back to runs" onAction={onBack} /></>
   return <DemoRunDetail onBack={onBack} run={run} />
+}
+
+function BackButton({ onBack }: { onBack: () => void }) {
+  return <button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" size={16} /> Back to runs</button>
 }
 
 function DemoRunDetail({ onBack, run }: { onBack: () => void; run: Run }) {
   const score = run.score ?? 0
-  return <><button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" size={16} /> Back to runs</button><div className="run-detail-header"><div><div className="run-id-line"><span className="run-id-badge">{run.id}</span><StatusBadge status={run.status} /></div><h1>{run.name}</h1><p>{run.model} <span>·</span> {run.dataset} <span>·</span> {run.completedAt}</p></div><div className="run-detail-actions"><button className="button button-quiet" type="button"><Icon name="download" size={15} /> Export</button><button className="button button-secondary" type="button"><Icon name="external-link" size={15} /> Open trace</button></div></div><div className="run-summary-grid"><div className="run-score-card"><span className="section-kicker">Overall score</span><strong>{score}<small>%</small></strong><span className="positive"><Icon name="trend-up" size={14} /> {run.scoreDelta ?? 0}% vs. prior run</span></div><div className="run-summary-card"><span className="summary-card-icon icon-green"><Icon name="check" size={16} /></span><span className="section-kicker">Passed cases</span><strong>{formatNumber(run.passedCases)} <small>/ {formatNumber(run.cases)}</small></strong><span>{Math.round((run.passedCases / run.cases) * 100)}% pass rate</span></div><div className="run-summary-card"><span className="summary-card-icon icon-violet"><Icon name="clock" size={16} /></span><span className="section-kicker">Duration</span><strong>{run.duration}</strong><span>Local deterministic fixture</span></div></div><div className="run-detail-grid"><section className="panel evaluators-panel"><div className="panel-heading"><div><span className="section-kicker">Independent checks</span><h2>Evaluator breakdown</h2></div><span className="muted-label">{demoEvaluators.length} invariants</span></div><div className="evaluator-list">{demoEvaluators.map((evaluator) => <EvaluatorRow evaluator={evaluator} key={evaluator.name} />)}</div></section><section className="panel config-panel"><div className="panel-heading"><div><span className="section-kicker">Run context</span><h2>Configuration</h2></div></div><dl className="config-list"><div><dt>Agent</dt><dd>{run.model}<small>{run.modelVersion}</small></dd></div><div><dt>Scenario</dt><dd>{run.dataset}<small>deterministic simulated payment</small></dd></div><div><dt>Evidence</dt><dd>ledger + trace<small>independent evaluator</small></dd></div><div><dt>Execution</dt><dd><span className="environment-dot" /> Local safe mode<small>untrusted code disabled</small></dd></div></dl></section></div><section className="evidence-panel"><div className="evidence-mark"><Icon name="shield" size={18} /></div><div><span className="section-kicker">Evidence preview</span><h2>Every result should be explainable.</h2><p>Trace-level events, ledger entries, failed invariants, and grounded recommendations are derived from deterministic local fixtures.</p></div><span className="text-button">Demo evidence <Icon name="check" size={14} /></span></section></>
+  return <><BackButton onBack={onBack} /><RunHeader run={run} /><div className="run-summary-grid"><div className={`run-score-card ${run.status === 'needs-review' ? 'run-score-card-failed' : ''}`}><span className="section-kicker">Fixture score</span><strong>{score}<small>%</small></strong><span className={run.status === 'needs-review' ? 'negative' : 'positive'}><Icon name={run.status === 'needs-review' ? 'warning' : 'check'} size={14} /> Repository-owned fixture</span></div><SummaryCard icon="check" tone="green" label="Passed cases" value={`${run.passedCases} / ${run.cases}`} detail={`${Math.round((run.passedCases / run.cases) * 100)}% fixture pass rate`} /><SummaryCard icon="activity" tone="violet" label="Trace events" value={run.duration.replace(' events', '')} detail="Local deterministic fixture" /></div><div className="run-detail-grid"><section className="panel evaluators-panel"><PanelTitle eyebrow="Independent checks" title="Evaluator breakdown" meta={`${demoEvaluators.length} fixture checks`} /><div className="evaluator-list">{demoEvaluators.map((evaluator) => <EvaluatorRow evaluator={evaluator} key={evaluator.name} />)}</div></section><section className="panel config-panel"><PanelTitle eyebrow="Execution context" title="Fixture configuration" /><div className="config-list"><ConfigRow label="Agent" value={run.model} /><ConfigRow label="Dataset" value={run.dataset} /><ConfigRow label="Run id" value={run.id} /><ConfigRow label="Persistence" value="Local fixture only" /></div></section></div><section className="panel fixture-evidence"><PanelTitle eyebrow="Evidence boundary" title="Why this detail is local" /><p>This detail is rendered from the repository-owned fixture set because no authenticated project is selected. It cannot be exported as an API report or written back to the server.</p><button className="text-button" onClick={() => onBack()} type="button">Return to run history <Icon name="arrow-right" size={15} /></button></section></>
 }
 
 function ApiRunDetail({ apiRun, onBack }: { apiRun: ApiRun; onBack: () => void }) {
   const report = apiRun.report
-  if (!report) return <><button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" size={16} /> Back to runs</button><div className="inline-error" role="alert">This persisted run has no report. {apiRun.error_message ?? 'The API did not return an execution report.'}</div></>
+  if (!report) return <><BackButton onBack={onBack} /><div className="inline-error" role="alert">This persisted run has no report. {apiRun.error_message ?? 'The API did not return an execution report.'}</div></>
   const score = runScore(report)
   const evaluation = report.evaluation
-  return <><button className="back-button" onClick={onBack} type="button"><Icon name="arrow-left" size={16} /> Back to runs</button><div className="run-detail-header"><div><div className="run-id-line"><span className="run-id-badge">{apiRun.id}</span><StatusBadge status={apiRun.state === 'passed' ? 'completed' : apiRun.state === 'failed' ? 'needs-review' : 'running'} /></div><h1>{report.agent_name}</h1><p>{formatScenario(apiRun.scenario)} <span>·</span> {formatDate(apiRun.completed_at ?? apiRun.created_at)} <span>·</span> persisted API report</p></div><div className="run-detail-actions"><button className="button button-quiet" onClick={() => downloadReport(apiRun)} type="button"><Icon name="download" size={15} /> Export JSON</button></div></div><div className="run-summary-grid"><div className={`run-score-card ${evaluation.passed ? '' : 'run-score-card-failed'}`}><span className="section-kicker">Report evaluation</span><strong>{score === null ? '—' : `${score}`}<small>{score === null ? '' : '%'}</small></strong><span className={evaluation.passed ? 'positive' : 'negative'}><Icon name={evaluation.passed ? 'check' : 'warning'} size={14} /> {evaluation.passed ? 'all invariants passed' : `${evaluation.findings.length} finding${evaluation.findings.length === 1 ? '' : 's'} recorded`}</span></div><div className="run-summary-card"><span className="summary-card-icon icon-violet"><Icon name="activity" size={16} /></span><span className="section-kicker">Trace events</span><strong>{formatNumber(report.trace.length)}</strong><span>from persisted report.trace</span></div><div className="run-summary-card"><span className="summary-card-icon icon-green"><Icon name="database" size={16} /></span><span className="section-kicker">Ledger entries</span><strong>{formatNumber(report.ledger.entries.length)}</strong><span>{report.order.status} final order state</span></div></div><div className="metric-grid report-metrics"><MetricCard label="Payment attempts" value={formatNumber(report.metrics.payment_attempts)} change="report.metrics" detail="derived by engine" icon="activity" tone="violet" /><MetricCard label="Ledger charges" value={formatNumber(report.metrics.ledger_charges)} change="report.metrics" detail="observable settlements" icon="database" tone="green" /><MetricCard label="Duplicate charges" value={formatNumber(report.metrics.duplicate_charges)} change="report.metrics" detail="independent ledger check" icon="warning" tone="amber" /><MetricCard label="Reconciliations" value={formatNumber(report.metrics.reconciliations)} change="report.metrics" detail="observable recovery events" icon="shield" tone="cyan" /></div><div className="run-detail-grid"><section className="panel evaluators-panel"><div className="panel-heading"><div><span className="section-kicker">Persisted evaluation.invariants</span><h2>Evaluator breakdown</h2></div><span className="muted-label">{evaluation.invariants.length} invariants</span></div><div className="evaluator-list">{evaluation.invariants.map((invariant) => <ApiInvariantRow invariant={invariant} key={invariant.name} />)}</div></section><section className="panel config-panel"><div className="panel-heading"><div><span className="section-kicker">Persisted run context</span><h2>Configuration</h2></div></div><dl className="config-list"><div><dt>Agent</dt><dd>{report.agent_name}<small>{apiRun.agent} integration</small></dd></div><div><dt>Scenario</dt><dd>{formatScenario(apiRun.scenario)}<small>persisted request value</small></dd></div><div><dt>Order</dt><dd>{report.order.order_id}<small>{report.order.amount} {report.order.currency} · {report.order.status}</small></dd></div><div><dt>Execution</dt><dd><span className="environment-dot environment-dot-live" /> API sample run<small>repository-owned agent only</small></dd></div></dl></section></div><ApiEvidence report={report} /><section className="panel findings-panel"><div className="panel-heading"><div><span className="section-kicker">Persisted evaluation.findings</span><h2>Grounded recommendations</h2></div><span className="muted-label">{evaluation.findings.length} findings</span></div>{evaluation.findings.length ? <div className="finding-list">{evaluation.findings.map((finding) => <article className={`finding-card finding-${finding.severity}`} key={finding.code}><div className="finding-heading"><span className="finding-severity">{finding.severity}</span><strong>{finding.title}</strong><span className="finding-code">{finding.code}</span></div><p>{finding.recommendation}</p><ul>{finding.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul></article>)}</div> : <EmptyPanel description="The persisted evaluator recorded no findings." />}</section><details className="raw-report"><summary>Inspect persisted report JSON</summary><pre>{JSON.stringify(report, null, 2)}</pre></details></>
+  return <><BackButton onBack={onBack} /><div className="run-detail-header"><div><div className="run-id-line"><span className="run-id-badge">{apiRun.id}</span><StatusBadge status={apiRun.state === 'passed' ? 'completed' : apiRun.state === 'failed' ? 'needs-review' : 'running'} /></div><h1>{report.agent_name}</h1><p>{formatScenario(apiRun.scenario)} <span>·</span> {formatDate(apiRun.completed_at ?? apiRun.created_at)} <span>·</span> persisted API report</p></div><div className="run-detail-actions"><button className="button button-quiet" onClick={() => downloadReport(apiRun)} type="button"><Icon name="download" size={15} /> Export JSON</button></div></div><div className="run-summary-grid"><div className={`run-score-card ${evaluation.passed ? '' : 'run-score-card-failed'}`}><span className="section-kicker">Report evaluation</span><strong>{score === null ? '—' : score}<small>{score === null ? '' : '%'}</small></strong><span className={evaluation.passed ? 'positive' : 'negative'}><Icon name={evaluation.passed ? 'check' : 'warning'} size={14} /> {evaluation.passed ? 'All invariants passed' : `${evaluation.findings.length} finding${evaluation.findings.length === 1 ? '' : 's'} recorded`}</span></div><SummaryCard icon="activity" tone="violet" label="Trace events" value={formatNumber(report.trace.length)} detail="From persisted report.trace" /><SummaryCard icon="database" tone="green" label="Ledger entries" value={formatNumber(report.ledger.entries.length)} detail={`${report.order.status} final order state`} /></div><div className="metric-grid report-metrics"><MetricCard label="Payment attempts" value={formatNumber(report.metrics.payment_attempts)} detail="report.metrics" icon="activity" tone="accent" /><MetricCard label="Retries" value={formatNumber(report.metrics.retries)} detail="report.metrics" icon="refresh" tone="violet" /><MetricCard label="Reconciliations" value={formatNumber(report.metrics.reconciliations)} detail="report.metrics" icon="shield" tone="green" /><MetricCard label="Duplicate charges" value={formatNumber(report.metrics.duplicate_charges)} detail="report.metrics" icon="warning" tone="amber" /></div><section className="panel evaluators-panel report-evaluators"><PanelTitle eyebrow="Independent checks" title="Evaluator breakdown" meta={`${evaluation.invariants.length} invariants`} /><div className="evaluator-list">{evaluation.invariants.map((invariant) => <ApiInvariantRow invariant={invariant} key={invariant.name} />)}</div></section><ApiEvidence report={report} /><FindingsPanel findings={evaluation.findings} /></>
+}
+
+function RunHeader({ run }: { run: Run }) {
+  return <div className="run-detail-header"><div><div className="run-id-line"><span className="run-id-badge">{run.id}</span><StatusBadge status={run.status} /></div><h1>{run.name}</h1><p>{run.model} <span>·</span> {run.dataset} <span>·</span> {run.completedAt}</p></div><span className="local-label"><Icon name="layers" size={14} /> fixture detail</span></div>
+}
+
+function SummaryCard({ detail, icon, label, tone, value }: { detail: string; icon: IconName; label: string; tone: string; value: string }) {
+  return <div className="run-summary-card"><span className={`summary-card-icon icon-${tone}`}><Icon name={icon} size={16} /></span><span className="section-kicker">{label}</span><strong>{value}</strong><span>{detail}</span></div>
+}
+
+function PanelTitle({ eyebrow, meta, title }: { eyebrow: string; meta?: string; title: string }) {
+  return <div className="panel-heading"><div><span className="section-kicker">{eyebrow}</span><h2>{title}</h2></div>{meta && <span className="muted-label">{meta}</span>}</div>
+}
+
+function EvaluatorRow({ evaluator }: { evaluator: EvaluatorResult }) {
+  const passed = evaluator.status === 'passed'
+  return <div className="evaluator-row"><span className={`evaluator-icon ${passed ? 'evaluator-pass' : 'evaluator-attention'}`}><Icon name={passed ? 'check' : 'warning'} size={15} /></span><span className="evaluator-copy"><strong>{evaluator.name}</strong><span>{evaluator.description}</span></span><span className={`evaluator-score ${passed ? '' : 'negative'}`}><strong>{evaluator.score}%</strong><small>{evaluator.passed}/{evaluator.total}</small></span></div>
 }
 
 function ApiInvariantRow({ invariant }: { invariant: ApiEvaluation['invariants'][number] }) {
-  return <div className="evaluator-row"><span className={`evaluator-icon ${invariant.passed ? 'evaluator-pass' : 'evaluator-attention'}`}><Icon name={invariant.passed ? 'check' : 'warning'} size={15} /></span><span className="evaluator-copy"><strong>{invariant.name}</strong><span>{invariant.evidence.length ? invariant.evidence.join(' · ') : 'No evidence recorded.'}</span></span><span className={`evaluator-score ${invariant.passed ? 'positive' : 'negative'}`}><strong>{invariant.passed ? 'PASS' : 'FAIL'}</strong><small>{invariant.evidence.length} evidence</small></span></div>
+  return <div className="evaluator-row"><span className={`evaluator-icon ${invariant.passed ? 'evaluator-pass' : 'evaluator-attention'}`}><Icon name={invariant.passed ? 'check' : 'warning'} size={15} /></span><span className="evaluator-copy"><strong>{invariant.name}</strong><span>{invariant.evidence.length ? invariant.evidence.join(' · ') : 'No evidence recorded.'}</span></span><span className={`evaluator-score ${invariant.passed ? '' : 'negative'}`}><strong>{invariant.passed ? 'PASS' : 'FAIL'}</strong><small>{invariant.evidence.length} evidence</small></span></div>
 }
 
 function ApiEvidence({ report }: { report: ApiReport }) {
-  return <section className="panel api-evidence-panel"><div className="panel-heading"><div><span className="section-kicker">Persisted evidence</span><h2>Ledger and trace</h2></div><span className="muted-label">report JSON</span></div><div className="evidence-columns"><div><h3>Ledger entries</h3>{report.ledger.entries.length ? <div className="ledger-list">{report.ledger.entries.map((entry) => <div className="ledger-entry" key={entry.entry_id}><span className="ledger-entry-icon"><Icon name={entry.entry_type === 'charge' ? 'database' : 'arrow-right'} size={14} /></span><span><strong>{entry.entry_id}</strong><small>{entry.entry_type} · {entry.payment_id} · key {entry.idempotency_key}</small></span><b>{entry.amount} {entry.currency}</b></div>)}</div> : <EmptyPanel description="No ledger entries recorded." />}</div><div><h3>Trace events</h3>{report.trace.length ? <div className="trace-list">{report.trace.map((event) => <div className="trace-entry" key={`${event.index}-${event.event_type}`}><span className="trace-index">{String(event.index).padStart(2, '0')}</span><span><strong>{event.event_type}</strong><small>{formatAttributes(event.attributes)}</small></span></div>)}</div> : <EmptyPanel description="No trace events recorded." />}</div></div></section>
+  return <section className="panel api-evidence-panel"><PanelTitle eyebrow="Persisted evidence" title="Ledger and trace" meta="report JSON" /><div className="evidence-columns"><div><h3>Ledger entries</h3>{report.ledger.entries.length ? <div className="ledger-list">{report.ledger.entries.map((entry) => <div className="ledger-entry" key={entry.entry_id}><span className="ledger-entry-icon"><Icon name={entry.entry_type === 'charge' ? 'database' : 'arrow-right'} size={14} /></span><span><strong>{entry.entry_id}</strong><small>{entry.entry_type} · {entry.payment_id} · key {entry.idempotency_key}</small></span><b>{entry.amount} {entry.currency}</b></div>)}</div> : <EmptyPanel description="No ledger entries recorded." />}</div><div><h3>Trace events</h3>{report.trace.length ? <div className="trace-list">{report.trace.map((event) => <div className="trace-entry" key={`${event.index}-${event.event_type}`}><span className="trace-index">{String(event.index).padStart(2, '0')}</span><span><strong>{event.event_type}</strong><small>{formatAttributes(event.attributes)}</small></span></div>)}</div> : <EmptyPanel description="No trace events recorded." />}</div></div></section>
+}
+
+function FindingsPanel({ findings }: { findings: ApiEvaluation['findings'] }) {
+  return <section className="panel findings-panel"><PanelTitle eyebrow="Evaluation findings" title="What needs attention" meta={`${findings.length} findings`} />{findings.length ? <div className="finding-list">{findings.map((finding) => <article className={`finding-card ${finding.severity.toLowerCase() === 'error' ? 'finding-error' : ''}`} key={finding.code}><div className="finding-heading"><Icon name={finding.severity.toLowerCase() === 'error' ? 'warning' : 'activity'} size={15} /><strong>{finding.title}</strong><span className="finding-code">{finding.code} · {finding.severity}</span></div><p>{finding.recommendation}</p>{finding.evidence.length > 0 && <small>{finding.evidence.join(' · ')}</small>}</article>)}</div> : <div className="success-empty"><Icon name="check" size={17} /><span>No findings recorded for this report.</span></div>}</section>
+}
+
+function ConfigRow({ label, value }: { label: string; value: string }) {
+  return <div className="config-row"><span>{label}</span><strong>{value}</strong></div>
 }
 
 function formatAttributes(attributes: Record<string, string | number | boolean | null>) {
@@ -813,21 +704,64 @@ function downloadReport(run: ApiRun) {
   const blob = new Blob([JSON.stringify(run.report, null, 2)], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = `${run.id}-report.json`
-  anchor.click()
-  URL.revokeObjectURL(url)
+  anchor.href = url; anchor.download = `${run.id}-report.json`; anchor.click(); URL.revokeObjectURL(url)
 }
 
-function EvaluatorRow({ evaluator }: { evaluator: EvaluatorResult }) {
-  return <div className="evaluator-row"><span className={`evaluator-icon ${evaluator.status === 'passed' ? 'evaluator-pass' : 'evaluator-attention'}`}><Icon name={evaluator.status === 'passed' ? 'check' : 'warning'} size={15} /></span><span className="evaluator-copy"><strong>{evaluator.name}</strong><span>{evaluator.description}</span></span><span className="evaluator-score"><strong>{evaluator.score}%</strong><small>{evaluator.passed}/{evaluator.total}</small></span><Icon name="chevron-right" size={16} className="row-chevron" /></div>
+function DatasetsPage({ datasets, onAdd }: { datasets: LocalDataset[]; onAdd: (dataset: LocalDataset) => void; onSelect: (view: View) => void }) {
+  const [formOpen, setFormOpen] = useState(false)
+  const [selectedId, setSelectedId] = useState(datasets[0]?.id ?? '')
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const selected = datasets.find((dataset) => dataset.id === selectedId)
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const dataset: LocalDataset = { id: `local-${Date.now()}`, name, description, cases: 0, kind: 'local', updated: 'Created locally' }
+    onAdd(dataset); setSelectedId(dataset.id); setName(''); setDescription(''); setFormOpen(false)
+  }
+  return <><PageIntro eyebrow="Local configuration" title="Datasets" description="Keep scenario context close to the work. This catalog is stored in your browser and does not create API resources." action={<button className="button button-secondary" onClick={() => setFormOpen((current) => !current)} type="button"><Icon name="file-plus" size={14} /> {formOpen ? 'Close form' : 'Add local dataset'}</button>} /><div className="local-state-banner"><Icon name="layers" size={16} /><span><strong>Frontend-local only.</strong> Repository fixtures remain read-only. New entries are saved to localStorage and are not sent with persisted API runs.</span></div>{formOpen && <form className="panel local-form" onSubmit={submit}><div><span className="section-kicker">New local entry</span><h2>Describe a dataset for your workspace</h2></div><label>Name<input onChange={(event) => setName(event.target.value)} placeholder="e.g. Checkout regressions" required value={name} /></label><label>Description<textarea onChange={(event) => setDescription(event.target.value)} placeholder="What does this set cover?" required rows={3} value={description} /></label><div className="form-actions"><button className="button button-primary" type="submit">Save locally</button><button className="button button-quiet" onClick={() => setFormOpen(false)} type="button">Cancel</button></div></form>}<div className="dataset-layout"><section className="panel dataset-list-panel"><PanelTitle eyebrow="Available context" title="Dataset catalog" meta={`${datasets.length} entries`} /><div className="dataset-list">{datasets.map((dataset) => <button className={`dataset-row ${selectedId === dataset.id ? 'dataset-row-active' : ''}`} key={dataset.id} onClick={() => setSelectedId(dataset.id)} type="button"><span className="dataset-icon"><Icon name={dataset.kind === 'fixture' ? 'database' : 'file-plus'} size={16} /></span><span><strong>{dataset.name}</strong><small>{dataset.cases ? `${dataset.cases} cases` : 'No cases defined'} · {dataset.kind === 'fixture' ? 'fixture' : 'local config'}</small></span><Icon name="chevron-right" size={15} /></button>)}</div></section><section className="panel dataset-detail"><PanelTitle eyebrow={selected?.kind === 'fixture' ? 'Repository fixture' : 'Local config'} title={selected?.name ?? 'Select a dataset'} />{selected ? <><p className="detail-copy">{selected.description}</p><div className="detail-facts"><ConfigRow label="Cases" value={selected.cases ? String(selected.cases) : 'Not defined'} /><ConfigRow label="Source" value={selected.kind === 'fixture' ? 'Repository-owned' : 'Browser localStorage'} /><ConfigRow label="Updated" value={selected.updated} /></div><div className="detail-callout"><Icon name="shield" size={15} /><span>{selected.kind === 'fixture' ? 'This fixture is available to inspect offline.' : 'This entry is a planning aid; connecting it to the API is not implemented.'}</span></div></> : <EmptyPanel description="Choose a dataset to inspect its local metadata." />}</section></div></>
+}
+
+function EvaluatorsPage({ enabled, onToggle }: { enabled: string[]; onToggle: (id: string) => void }) {
+  return <><PageIntro eyebrow="Local configuration" title="Evaluators" description="Understand the checks behind a report and choose which checks you want to keep visible in this browser." /><div className="local-state-banner"><Icon name="sliders" size={16} /><span><strong>Configuration-only state.</strong> These toggles are stored locally for workspace organization. Persisted API evaluation results still come from <code>report.evaluation</code>.</span></div><div className="evaluator-config-grid">{evaluatorDefinitions.map((evaluator) => { const isEnabled = enabled.includes(evaluator.id); return <article className={`panel evaluator-config-card ${isEnabled ? '' : 'is-disabled'}`} key={evaluator.id}><div className="evaluator-config-top"><span className="evaluator-icon evaluator-pass"><Icon name="check" size={15} /></span><span className="local-pill">{evaluator.owner}</span></div><h2>{evaluator.name}</h2><p>{evaluator.description}</p><div className="toggle-row"><span>{isEnabled ? 'Visible in local workspace' : 'Hidden locally'}</span><button aria-pressed={isEnabled} className={`switch ${isEnabled ? 'switch-on' : ''}`} onClick={() => onToggle(evaluator.id)} type="button"><span /></button></div></article> })}</div><section className="panel evaluator-note"><Icon name="shield" size={17} /><div><strong>How report evaluation works</strong><p>When a persisted run is created, the API executes the sample agent and returns its own invariant and finding results. This page does not replace or edit those server-backed results.</p></div></section></>
+}
+
+function SettingsPage({ apiStatus, enabledEvaluators, localSettings, onCheck, onReset, onSettingsChange, onThemeChange, session, theme }: { apiStatus: ApiStatus; enabledEvaluators: number; localSettings: LocalSettings; onCheck: () => void; onReset: () => void; onSettingsChange: (next: Partial<LocalSettings>) => void; onThemeChange: (theme: Theme) => void; session: Session | null; theme: Theme }) {
+  return <><PageIntro eyebrow="Workspace preferences" title="Settings" description="Tune the local shell and inspect the current API connection without implying server-side configuration." /><div className="settings-grid"><section className="panel settings-section"><PanelTitle eyebrow="Appearance" title="Theme" meta="Saved locally" /><p className="settings-description">Choose a durable light or dark presentation for this browser.</p><div className="theme-options"><button className={`theme-option ${theme === 'light' ? 'theme-option-active' : ''}`} onClick={() => onThemeChange('light')} type="button"><Icon name="sun" size={18} /><span><strong>Light</strong><small>Bright workspace</small></span></button><button className={`theme-option ${theme === 'dark' ? 'theme-option-active' : ''}`} onClick={() => onThemeChange('dark')} type="button"><Icon name="moon" size={18} /><span><strong>Dark</strong><small>Low-glare workspace</small></span></button></div></section><section className="panel settings-section"><PanelTitle eyebrow="API connection" title="Service status" meta="Read-only check" /><div className="connection-row"><span className={`connection-indicator connection-${apiStatus}`} /><span><strong>{apiStatus === 'online' ? 'API reachable' : apiStatus === 'offline' ? 'API unavailable' : 'Checking API'}</strong><small>{import.meta.env.VITE_API_URL ?? 'http://localhost:8000'}</small></span><button className="button button-quiet" onClick={onCheck} type="button"><Icon name="refresh" size={14} /> Check</button></div><p className="settings-description">The endpoint is read from <code>VITE_API_URL</code> or the client default. There is no editable remote configuration in this page.</p></section><section className="panel settings-section"><PanelTitle eyebrow="Local behavior" title="Workspace hints" meta={`${enabledEvaluators} evaluators visible`} /><label className="check-row"><input checked={localSettings.showFixtureHints} onChange={(event) => onSettingsChange({ showFixtureHints: event.target.checked })} type="checkbox" /><span><strong>Show data source notices</strong><small>Keep fixture and persisted-data boundaries visible.</small></span></label><label className="check-row"><input checked={localSettings.compactRows} onChange={(event) => onSettingsChange({ compactRows: event.target.checked })} type="checkbox" /><span><strong>Use compact run rows</strong><small>Reduce table row height in Agent runs.</small></span></label></section><section className="panel settings-section danger-section"><PanelTitle eyebrow="Local data" title="Reset browser configuration" /><p className="settings-description">Restore locally created dataset entries, evaluator visibility, and display preferences. This does not delete API projects, runs, or reports.</p><button className="button button-quiet" onClick={onReset} type="button">Reset local configuration</button></section></div><section className="panel account-section"><PanelTitle eyebrow="Authentication" title="Current session" />{session ? <div className="account-row"><span className="user-avatar">{session.user.email.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.email}</strong><small>Authenticated API session</small></span></div> : <div className="account-row"><span className="user-avatar">DE</span><span><strong>No authenticated session</strong><small>Local fixtures remain available offline.</small></span></div>}</section></>
+}
+
+function CliGuide() {
+  const [language, setLanguage] = useState<'curl' | 'node'>('curl')
+  const curlAuth = `curl -s -X POST http://localhost:8000/api/v1/auth/login -H 'Content-Type: application/json' -d '{"email":"you@example.com","password":"your-password"}'`
+  const nodeAuth = [
+    "const response = await fetch(`${API_URL}/api/v1/auth/login`, {",
+    "  method: 'POST',",
+    "  headers: { 'Content-Type': 'application/json' },",
+    "  body: JSON.stringify({ email, password }),",
+    '})',
+    'const { access_token } = await response.json()',
+  ].join('\n')
+  const createRun = `curl -s -X POST http://localhost:8000/api/v1/projects/PROJECT_ID/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"agent":"safe","scenario":"timeout_after_success"}'`
+  const fetchReport = 'curl -s http://localhost:8000/api/v1/runs/RUN_ID -H "Authorization: Bearer $TOKEN"'
+  return <><PageIntro eyebrow="Developer workflow" title="CLI guide" description="Use the same HTTP surface as the frontend from a terminal. These commands are examples for your configured API; the page does not execute them." action={<span className="local-pill"><Icon name="terminal" size={13} /> HTTP-first</span>} /><div className="cli-layout"><aside className="panel cli-nav"><span className="section-kicker">Contents</span><a href="#health">01 · Check health</a><a href="#auth">02 · Authenticate</a><a href="#run">03 · Create a run</a><a href="#report">04 · Fetch evidence</a></aside><div className="cli-content"><section className="cli-section" id="health"><StepHeading number="01" title="Check the API" description="Confirm the service is reachable before authenticating." /><CommandBlock command="curl -s http://localhost:8000/health" /></section><section className="cli-section" id="auth"><StepHeading number="02" title="Authenticate" description="Register once, then use the returned access token for protected project and run requests." /><div className="code-tabs"><button className={language === 'curl' ? 'code-tab-active' : ''} onClick={() => setLanguage('curl')} type="button">curl</button><button className={language === 'node' ? 'code-tab-active' : ''} onClick={() => setLanguage('node')} type="button">Node fetch</button></div><CommandBlock command={language === 'curl' ? curlAuth : nodeAuth} /></section><section className="cli-section" id="run"><StepHeading number="03" title="Create a run" description="Create a project, then submit one of the repository-owned sample agents and scenarios." /><CommandBlock command={createRun} /></section><section className="cli-section" id="report"><StepHeading number="04" title="Fetch the report" description="The frontend uses this protected detail endpoint so the run page can show the persisted evidence." /><CommandBlock command={fetchReport} /></section></div></div></>
+}
+
+function StepHeading({ description, number, title }: { description: string; number: string; title: string }) {
+  return <div className="step-heading"><span>{number}</span><div><h2>{title}</h2><p>{description}</p></div></div>
+}
+
+function CommandBlock({ command }: { command: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(command); setCopied(true); window.setTimeout(() => setCopied(false), 1600) } catch { setCopied(false) }
+  }
+  return <div className="command-block"><pre><code>{command}</code></pre><button aria-label="Copy command" className="copy-button" onClick={() => void copy()} type="button"><Icon name={copied ? 'check' : 'copy'} size={15} />{copied ? 'Copied' : 'Copy'}</button></div>
 }
 
 function EmptyPanel({ description }: { description: string }) {
   return <div className="empty-panel"><Icon name="layers" size={18} /><span>{description}</span></div>
 }
 
-function EmptyState({ title, description, actionLabel, onAction }: { title: string; description: string; actionLabel: string; onAction: () => void }) {
+function EmptyState({ actionLabel, description, onAction, title }: { actionLabel: string; description: string; onAction: () => void; title: string }) {
   return <section className="empty-state"><span className="empty-state-icon"><Icon name="layers" size={21} /></span><h2>{title}</h2><p>{description}</p><button className="button button-secondary" onClick={onAction} type="button">{actionLabel} <Icon name="arrow-right" size={14} /></button></section>
 }
 

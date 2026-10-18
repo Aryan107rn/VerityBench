@@ -16,9 +16,10 @@ The strongest five-minute demo is the payment-timeout recovery story:
    original idempotency key and reconciling provider state.
 4. Show the safe agent reconciles the original payment and produces exactly one
    charge with a passing report.
-5. Open the light-theme web workspace, sign in, create a project, choose the
-   timeout scenario, and show the persisted report's trace, ledger, invariants,
-   findings, and JSON export.
+5. Open the web workspace, sign in, create a project, choose the timeout
+    scenario, and show the persisted report's trace, ledger, invariants,
+    findings, and JSON export. Briefly show the Datasets, Evaluators, Settings,
+    and CLI guide pages to demonstrate the complete developer workspace.
 
 ## Exact CLI demo
 
@@ -27,6 +28,7 @@ From a clean checkout:
 ```bash
 python3.12 -m venv .venv
 . .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.lock
 python -m pip install -e .
 veritybench demo
@@ -48,8 +50,16 @@ The command writes two reproducible reports, which are ignored by Git:
 
 Start the API and frontend in separate terminals:
 
+API terminal, from the repository root:
+
 ```bash
-uvicorn veritybench.api.main:app --reload --port 8000
+. .venv/bin/activate
+python -m uvicorn veritybench.api.main:app --reload --port 8000
+```
+
+Frontend terminal:
+
+```bash
 cd frontend
 npm ci
 npm run dev
@@ -57,26 +67,33 @@ npm run dev
 
 Open <http://localhost:5173>, then:
 
-1. Select **Sign in or register**.
-2. Create a project named `Hackathon demo`.
-3. Open **Agent runs**.
-4. Select `defective-sample-agent` and `Timeout after success`.
-5. Run and persist the report.
-6. Show the failed evaluation, duplicate-charge metric, ledger entries, trace,
+1. On **Overview**, select **Sign in or register**.
+2. Register with an email and a password of at least 12 characters.
+3. Create a project named `Hackathon demo`.
+4. Open **Agent runs**.
+5. Select `defective-sample-agent` and **Timeout after success**.
+6. Select **Run and persist report**, then open the resulting run detail.
+7. Show the failed evaluation, duplicate-charge metric, ledger entries, trace,
    failed invariant, and recommendation.
-7. Run `safe-sample-agent` with the same scenario and show the passing report.
+8. Run `safe-sample-agent` with the same scenario and show the passing report.
+9. On the persisted run detail page, select **Export JSON**.
 
-The dashboard uses white surfaces, navy text, AWS-console-inspired orange
-actions, blue technical links, and dense evidence panels. When no API session
-exists, the UI falls back to explicitly labelled read-only fixtures.
+The workspace has an **Overview** page at `/`, **Agent runs** at `/runs`, run
+detail at `/runs/:id`, plus **Datasets** at `/datasets`, **Evaluators** at
+`/evaluators`, **Settings** at `/settings`, and the **CLI guide** at `/cli`.
+Datasets, evaluator visibility, and appearance preferences are intentionally
+browser-local; API reports remain authoritative. When no API session and project
+are selected, the app falls back to explicitly labelled read-only fixtures. A
+live run is only persisted after authentication and project selection.
 
 ## Judging-safe scope statement
 
-The demo intentionally executes only repository-owned deterministic sample
-agents. Uploaded repositories, ZIP files, arbitrary Python, external URLs, and
-real payment systems are disabled. This avoids presenting ordinary Docker or a
-web API process as a sufficient hostile-code sandbox. The architecture and
-integration contract document the next safe extension point.
+The demo intentionally executes only the two repository-owned deterministic
+sample agents: `safe-sample-agent` and `defective-sample-agent`. Uploaded
+repositories, ZIP files, arbitrary Python, arbitrary HTTP agents, external
+URLs, and real payment systems are disabled. The CLI and API simulate payment
+behavior locally; they do not provide a hostile-code sandbox. This is a
+deliberate safety boundary until a dedicated sandbox is available.
 
 ## Submission checklist
 
