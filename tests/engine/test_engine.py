@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import pytest
+
+from veritybench_engine import (
+    DefectiveSampleAgent,
+    FaultScenario,
+    Ledger,
+    LedgerEntry,
+    LedgerEntryType,
+    Order,
+    OrderStatus,
+    SafeSampleAgent,
+    TraceEventType,
+    evaluate_state,
+    simulate,
+)
+
+
+def event_types(result):
+    return [event.event_type for event in result.trace]
+
+
+def test_normal_operation_fulfills_once_and_is_evaluated_from_ledger():
+    result = simulate()
+
+    assert result.order.status is OrderStatus.FULFILLED
+    assert result.order.attempts == 1
+    assert len(result.ledger.charges) == 1
+    assert result.ledger.total_charged == 100
+    assert result.metrics.payment_attempts == 1
+    assert result.metrics.successful_payments == 1
+    assert result.metrics.ledger_charges == 1
+    assert result.evaluation.passed
+    assert TraceEventType.ORDER_FULFILLED in event_types(result)
+
+
+def test_timeout_after_success_is_reconciled_without_a_second_charge():
+    result = simulate(FaultScenario.TIMEOUT_AFTER_SUCCESS, agent=SafeSampleAgent())
+
+    assert result.order.status is OrderStatus.FULFILLED
+    assert result.order.attempts == 1
+    assert len(result.ledger.charges) == 1
+    assert result.metrics.timeouts == 1
+    assert result.metrics.reconciliations == 1
+    assert result.metrics.duplicate_charges == 0
+    assert result.evaluation.passed
+    assert TraceEventType.PAYMENT_RECONCILED in event_types(result)
+
+
+def test_defective_timeout_retry_is_detected_with_ledger_evidence():
+    result = simulate(FaultScenario.TIMEOUT_AFTER_SUCCESS, agent=DefectiveSampleAgent())
+
+    assert result.order.status is OrderStatus.FULFILLED
+    assert len(result.ledger.charges) == 2
+    assert result.metrics.duplicate_charges == 1
+    assert not result.evaluation.passed
+    finding = next(item for item in result.evaluation.findings if item.code == "DUPLICATE_CHARGE")
+    assert finding.evidence == (
+        "ledger entry ledger-001: 100 USD",
+        "ledger entry ledger-002: 100 USD",
+    )
+    assert "idempotency" in finding.recommendation
+
+
+def test_temporary_failure_retries_and_then_succeeds():
+    result = simulate(FaultScenario.TEMPORARY_FAILURE)
+
+    assert result.order.status is OrderStatus.FULFILLED
+    assert result.order.attempts == 2
+    assert result.metrics.temporary_failures == 1
+    assert result.metrics.retries == 1
+    assert result.metrics.successful_payments == 1
+    assert len(result.ledger.charges) == 1
+    assert result.evaluation.passed
+
+
+def test_malformed_response_is_safely_cancelled_and_defective_fulfillment_is_flagged():
+    safe_result = simulate(FaultScenario.MALFORMED_RESPONSE, agent=SafeSampleAgent())
+    defective_result = simulate(FaultScenario.MALFORMED_RESPONSE, agent=DefectiveSampleAgent())
+
+    assert safe_result.order.status is OrderStatus.CANCELLED
+    assert safe_result.metrics.malformed_responses == 1
+    assert not safe_result.ledger.charges
+    assert safe_result.evaluation.passed
+
+    assert defective_result.order.status is OrderStatus.FULFILLED
+    assert not defective_result.ledger.charges
+    assert not defective_result.evaluation.passed
+    assert any(item.code == "UNPAID_FULFILLMENT" for item in defective_result.evaluation.findings)
+
+
+def test_unrecoverable_failure_is_cancelled_without_a_charge():
+    result = simulate(FaultScenario.UNRECOVERABLE_FAILURE)
+
+    assert result.order.status is OrderStatus.CANCELLED
+    assert result.metrics.unrecoverable_failures == 1
+    assert result.metrics.cancelled_orders == 1
+    assert not result.ledger.charges
+    assert result.evaluation.passed
+
+
+def test_evaluation_can_run_against_an_independently_constructed_bad_snapshot():
+    order = Order(
+        order_id="order-bad",
+        amount=100,
+        currency="USD",
+        status=OrderStatus.FULFILLED,
+        attempts=2,
+        payment_id="payment-order-bad-002",
+        idempotency_key="payment:order-bad",
+    )
+    ledger = Ledger(
+        entries=(
+            LedgerEntry(
+                entry_id="ledger-001",
+                order_id="order-bad",
+                payment_id="payment-order-bad-001",
+                amount=100,
+                currency="USD",
+                entry_type=LedgerEntryType.CHARGE,
+                idempotency_key="payment:order-bad",
+            ),
+            LedgerEntry(
+                entry_id="ledger-002",
+                order_id="order-bad",
+                payment_id="payment-order-bad-002",
+                amount=100,
+                currency="USD",
+                entry_type=LedgerEntryType.CHARGE,
+                idempotency_key="payment:order-bad:retry:2",
+            ),
+        )
+    )
+
+    report = evaluate_state(order, ledger, ())
+
+    assert not report.passed
+    assert {item.code for item in report.findings} >= {
+        "DUPLICATE_CHARGE",
+        "SETTLEMENT_MISMATCH",
+    }
+
+
+def test_runs_are_byte_for_byte_stable_as_serializable_records():
+    first = simulate(FaultScenario.TIMEOUT_AFTER_SUCCESS).to_dict()
+    second = simulate(FaultScenario.TIMEOUT_AFTER_SUCCESS).to_dict()
+
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [FaultScenario.NORMAL, FaultScenario.TIMEOUT_AFTER_SUCCESS, FaultScenario.TEMPORARY_FAILURE],
+)
+def test_safe_scenarios_end_in_one_charge_or_clean_recovery(scenario):
+    result = simulate(scenario)
+
+    assert result.evaluation.passed
+    assert result.order.status is OrderStatus.FULFILLED
+    assert len(result.ledger.charges) == 1

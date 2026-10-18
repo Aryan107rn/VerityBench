@@ -1,16 +1,18 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { demoCoverage, demoEvaluators, demoRuns, demoTrend } from './data/demo'
 import { Icon, type IconName } from './components/Icon'
 import type { CoverageItem, EvaluatorResult, Run, View } from './types'
+import { createApiClient, type ApiClient } from './lib/api'
+import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
 
 const navItems: Array<{ id: View; label: string; icon: IconName }> = [
   { id: 'overview', label: 'Overview', icon: 'layers' },
-  { id: 'dashboard', label: 'Evaluation runs', icon: 'activity' },
+  { id: 'dashboard', label: 'Agent runs', icon: 'activity' },
 ]
 
 const viewLabels: Record<View, string> = {
   overview: 'Overview',
-  dashboard: 'Evaluation runs',
+  dashboard: 'Agent runs',
   run: 'Run detail',
 }
 
@@ -33,11 +35,12 @@ function StatusBadge({ status }: { status: Run['status'] }) {
   )
 }
 
-function DemoPill() {
+function DemoPill({ apiStatus }: { apiStatus: 'checking' | 'online' | 'offline' }) {
+  const label = apiStatus === 'online' ? 'API connected' : apiStatus === 'checking' ? 'Checking API' : 'Local demo'
   return (
     <span className="demo-pill">
       <span className="demo-pulse" />
-      Demo environment
+      {label}
     </span>
   )
 }
@@ -52,18 +55,30 @@ function BrandMark() {
   )
 }
 
-function App() {
-  const [view, setView] = useState<View>('overview')
-  const [selectedRunId, setSelectedRunId] = useState(demoRuns[0].id)
+function Workspace() {
+  const api = useMemo(() => createApiClient(), [])
+  const location = useLocation()
+  const navigate = useNavigate()
+  const view: View = location.pathname === '/runs' ? 'dashboard' : location.pathname.startsWith('/runs/') ? 'run' : 'overview'
+  const selectedRunId = location.pathname.startsWith('/runs/') ? decodeURIComponent(location.pathname.slice('/runs/'.length)) : demoRuns[0].id
+  const [apiStatus, setApiStatus] = useState<'checking' | 'online' | 'offline'>('checking')
+  const [authOpen, setAuthOpen] = useState(false)
+  const [userEmail, setUserEmail] = useState<string | null>(null)
   const selectedRun = useMemo(
     () => demoRuns.find((run) => run.id === selectedRunId) ?? demoRuns[0],
     [selectedRunId],
   )
 
+  const setView = (nextView: View) => navigate(nextView === 'overview' ? '/' : '/runs')
   const openRun = (runId: string) => {
-    setSelectedRunId(runId)
-    setView('run')
+    navigate(`/runs/${encodeURIComponent(runId)}`)
   }
+
+  useEffect(() => {
+    let active = true
+    api.getHealth().then(() => active && setApiStatus('online')).catch(() => active && setApiStatus('offline'))
+    return () => { active = false }
+  }, [api])
 
   return (
     <div className="app-shell">
@@ -82,7 +97,7 @@ function App() {
           <span className="workspace-avatar">V</span>
           <span className="workspace-copy">
             <span className="workspace-label">Workspace</span>
-            <strong>verity-labs</strong>
+            <strong>sample workspace</strong>
           </span>
           <Icon name="chevron-down" size={15} />
         </div>
@@ -129,7 +144,7 @@ function App() {
             <div aria-label="Monthly usage: 32 percent" aria-valuemax={100} aria-valuemin={0} aria-valuenow={32} className="progress-track" role="progressbar">
               <span className="progress-fill usage-fill" />
             </div>
-            <span className="usage-footnote">3,840 of 12,000 cases</span>
+             <span className="usage-footnote">4 scenarios in local suite</span>
           </div>
           <div className="user-row">
             <span className="user-avatar">AV</span>
@@ -150,7 +165,7 @@ function App() {
             <strong>{viewLabels[view]}</strong>
           </div>
           <div className="topbar-actions">
-            <DemoPill />
+            <DemoPill apiStatus={apiStatus} />
             <button aria-label="Search" className="search-button" type="button">
               <Icon name="search" size={16} />
               <span>Search</span>
@@ -160,14 +175,14 @@ function App() {
               <Icon name="activity" size={18} />
               <span className="notification-dot" />
             </button>
-            <span aria-label="Alex V. profile" className="topbar-avatar">AV</span>
+            <button aria-label={userEmail ? `Signed in as ${userEmail}` : 'Sign in'} className="topbar-avatar profile-button" onClick={() => setAuthOpen(true)} type="button">{userEmail ? userEmail.slice(0, 2).toUpperCase() : 'SI'}</button>
           </div>
         </header>
 
         <main className="page-content">
           <div className="demo-banner">
             <Icon name="sparkles" size={16} />
-            <span><strong>Demo data</strong> · This workspace uses local fixtures until an API is connected.</span>
+            <span><strong>Safe local mode</strong> · Only repository-owned sample agents run here; imported code is disabled.</span>
             <button aria-label="Dismiss demo data notice" className="banner-dismiss" type="button">×</button>
           </div>
 
@@ -176,6 +191,47 @@ function App() {
           {view === 'run' && <RunDetail run={selectedRun} onBack={() => setView('dashboard')} />}
         </main>
       </div>
+      {authOpen && <AuthPanel api={api} onClose={() => setAuthOpen(false)} onSignedIn={(email) => { setUserEmail(email); setAuthOpen(false) }} />}
+    </div>
+  )
+}
+
+function AuthPanel({ api, onClose, onSignedIn }: { api: ApiClient; onClose: () => void; onSignedIn: (email: string) => void }) {
+  const [mode, setMode] = useState<'login' | 'register'>('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      const result = mode === 'login' ? await api.login(email, password) : await api.register(email, password)
+      onSignedIn(result.user.email)
+    } catch {
+      setError('The API could not authenticate this account. Check the server and credentials.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="auth-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section aria-labelledby="auth-title" aria-modal="true" className="auth-panel" role="dialog">
+        <button aria-label="Close authentication dialog" className="auth-close" onClick={onClose} type="button">×</button>
+        <span className="eyebrow"><Icon name="shield" size={14} /> Protected workspace</span>
+        <h2 id="auth-title">{mode === 'login' ? 'Sign in to VerityBench' : 'Create your workspace'}</h2>
+        <p className="auth-description">Protected projects and reports are authorized server-side. No credentials are sent to the sample agent.</p>
+        <form onSubmit={submit}>
+          <label>Email<input autoComplete="email" onChange={(event) => setEmail(event.target.value)} required type="email" value={email} /></label>
+          <label>Password<input autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={12} onChange={(event) => setPassword(event.target.value)} required type="password" value={password} /></label>
+          {error && <p className="auth-error" role="alert">{error}</p>}
+          <button className="button button-primary auth-submit" disabled={busy} type="submit">{busy ? 'Working…' : mode === 'login' ? 'Sign in' : 'Register'}</button>
+        </form>
+        <button className="auth-switch" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError('') }} type="button">{mode === 'login' ? 'Need an account? Register' : 'Already registered? Sign in'}</button>
+      </section>
     </div>
   )
 }
@@ -208,9 +264,9 @@ function Overview({ onNavigate, onOpenRun }: { onNavigate: (view: View) => void;
     <>
       <section className="hero-grid">
         <div className="hero-copy">
-          <span className="eyebrow"><Icon name="sparkles" size={14} /> Model reliability workspace</span>
-          <h1>Measure what your models <span>actually know.</span></h1>
-          <p>Turn evaluation signals into confident releases. VerityBench brings your model, dataset, and evidence into one calm workspace.</p>
+          <span className="eyebrow"><Icon name="sparkles" size={14} /> Agent reliability workspace</span>
+          <h1>Test agents. <span>Trust the evidence.</span></h1>
+          <p>Exercise agent workflows against controlled failures, then verify observable outcomes instead of trusting the agent's success claim.</p>
           <div className="hero-actions">
             <button className="button button-primary" onClick={() => onNavigate('dashboard')} type="button">
               Explore runs <Icon name="arrow-right" size={16} />
@@ -220,8 +276,8 @@ function Overview({ onNavigate, onOpenRun }: { onNavigate: (view: View) => void;
             </button>
           </div>
           <div className="hero-meta">
-            <span><Icon name="check" size={14} /> 3,840 cases evaluated</span>
-            <span><Icon name="shield" size={14} /> Release-ready signals</span>
+            <span><Icon name="check" size={14} /> deterministic sample suite</span>
+            <span><Icon name="shield" size={14} /> independent ledger checks</span>
           </div>
         </div>
         <PulseCard />
@@ -236,9 +292,9 @@ function Overview({ onNavigate, onOpenRun }: { onNavigate: (view: View) => void;
       </div>
 
       <div className="metric-grid">
-        <MetricCard label="Average score" value="86.4%" change="+4.8%" detail="vs. previous 7 days" icon="gauge" tone="cyan" />
-        <MetricCard label="Cases evaluated" value="3,840" change="+18.2%" detail="across 12 runs" icon="layers" tone="violet" />
-        <MetricCard label="Release confidence" value="94%" change="+2.1%" detail="above your 90% target" icon="shield" tone="green" />
+        <MetricCard label="Suite pass rate" value="75%" change="3 / 4" detail="local sample scenarios" icon="gauge" tone="cyan" />
+        <MetricCard label="Recorded traces" value="30" change="actual" detail="events across demo runs" icon="layers" tone="violet" />
+        <MetricCard label="Duplicate charges" value="01" change="blocked" detail="independent evaluator finding" icon="shield" tone="green" />
       </div>
 
       <div className="overview-columns">
@@ -249,9 +305,9 @@ function Overview({ onNavigate, onOpenRun }: { onNavigate: (view: View) => void;
       <section className="insight-strip">
         <div className="insight-icon"><Icon name="trend-up" size={19} /></div>
         <div>
-          <span className="section-kicker">Demo insight</span>
-          <h3>Safety improved 6.2% after the latest prompt revision.</h3>
-          <p>Compare run-042 against the prior baseline to inspect the evidence behind the lift.</p>
+          <span className="section-kicker">Evidence insight</span>
+          <h3>The defective agent created two charges after a lost response.</h3>
+          <p>Open the failed run to inspect ledger entries and the idempotency recommendation.</p>
         </div>
         <button className="text-button" onClick={() => onOpenRun(demoRuns[0].id)} type="button">Inspect evidence <Icon name="arrow-right" size={15} /></button>
       </section>
@@ -265,11 +321,11 @@ function PulseCard() {
       <div className="pulse-orbit orbit-one" />
       <div className="pulse-orbit orbit-two" />
       <div className="pulse-card-top">
-        <span className="card-label"><span className="live-dot" /> Evaluation pulse</span>
+        <span className="card-label"><span className="live-dot" /> Reliability pulse</span>
         <button aria-label="Pulse card options" className="icon-button subtle-icon" type="button"><Icon name="more" size={18} /></button>
       </div>
-      <div className="pulse-score">92.8<span>%</span></div>
-      <div className="pulse-score-label">Latest release gate score</div>
+      <div className="pulse-score">100<span>%</span></div>
+      <div className="pulse-score-label">Safe timeout recovery verified</div>
       <div className="pulse-chart" aria-label="Score trend rising from 78 to 93 percent" role="img">
         <svg preserveAspectRatio="none" viewBox="0 0 440 112">
           <defs>
@@ -283,7 +339,7 @@ function PulseCard() {
           <circle cx="440" cy="7" fill="#63e6d5" r="4" />
         </svg>
       </div>
-      <div className="pulse-footer"><span><Icon name="trend-up" size={14} /> 4.8% lift</span><span>Last 7 days</span></div>
+      <div className="pulse-footer"><span><Icon name="check" size={14} /> ledger verified</span><span>deterministic run</span></div>
     </div>
   )
 }
@@ -335,7 +391,7 @@ function CoveragePanel() {
       <div className="coverage-list">
         {demoCoverage.map((item) => <CoverageBar item={item} key={item.label} />)}
       </div>
-      <div className="coverage-note"><Icon name="shield" size={15} /> <span>All signals are from the local demo dataset.</span></div>
+       <div className="coverage-note"><Icon name="shield" size={15} /> <span>All signals are from deterministic local fixtures.</span></div>
     </section>
   )
 }
@@ -352,12 +408,12 @@ function CoverageBar({ item }: { item: CoverageItem }) {
 function Dashboard({ onOpenRun }: { onOpenRun: (id: string) => void }) {
   return (
     <>
-      <PageIntro eyebrow="Evaluation workspace" title="Evaluation runs" description="A clear view of how your models behave across the checks that matter." action={<button className="button button-primary" type="button"><Icon name="play" size={14} /> New evaluation</button>} />
+       <PageIntro eyebrow="Agent reliability workspace" title="Agent runs" description="Replay controlled scenarios and inspect the evidence behind every outcome." action={<button className="button button-primary" type="button"><Icon name="play" size={14} /> Run local suite</button>} />
       <div className="metric-grid dashboard-metrics">
-        <MetricCard label="Average score" value="86.4%" change="+4.8%" detail="vs. previous 7 days" icon="gauge" tone="cyan" />
-        <MetricCard label="Total evaluations" value="12" change="+3" detail="this week" icon="activity" tone="violet" />
-        <MetricCard label="Passing cases" value="3,262" change="85.0%" detail="of 3,840 evaluated" icon="check" tone="green" />
-        <MetricCard label="Needs attention" value="02" change="-1" detail="since last baseline" icon="warning" tone="amber" />
+         <MetricCard label="Suite pass rate" value="75%" change="3 / 4" detail="local sample scenarios" icon="gauge" tone="cyan" />
+         <MetricCard label="Recorded traces" value="30" change="actual" detail="events across demo runs" icon="activity" tone="violet" />
+         <MetricCard label="Duplicate charges" value="01" change="blocked" detail="independent evaluator finding" icon="warning" tone="amber" />
+         <MetricCard label="Safe retests" value="03" change="passed" detail="with ledger evidence" icon="check" tone="green" />
       </div>
       <div className="dashboard-grid">
         <TrendPanel />
@@ -365,7 +421,7 @@ function Dashboard({ onOpenRun }: { onOpenRun: (id: string) => void }) {
       </div>
       <section className="panel runs-table-panel">
         <div className="panel-heading table-heading">
-          <div><span className="section-kicker">Local demo dataset</span><h2>All evaluation runs</h2></div>
+           <div><span className="section-kicker">Deterministic sample suite</span><h2>All agent runs</h2></div>
           <div className="table-actions"><button className="button button-quiet" type="button"><Icon name="sliders" size={15} /> Filter</button><button aria-label="Download runs" className="icon-button subtle-icon" type="button"><Icon name="download" size={16} /></button></div>
         </div>
         <div className="runs-table-wrap">
@@ -385,7 +441,7 @@ function TrendPanel() {
   return (
     <section className="panel trend-panel">
       <div className="panel-heading"><div><span className="section-kicker">Quality over time</span><h2>Score trend</h2></div><span className="chart-period">Last 7 days <Icon name="chevron-down" size={14} /></span></div>
-      <div className="trend-summary"><strong>86.4%</strong><span className="positive"><Icon name="trend-up" size={14} /> 4.8% from last week</span></div>
+      <div className="trend-summary"><strong>75%</strong><span className="positive"><Icon name="trend-up" size={14} /> safe paths pass</span></div>
       <div className="trend-chart">
         <div className="chart-y-labels"><span>100</span><span>90</span><span>80</span><span>70</span></div>
         <svg preserveAspectRatio="none" viewBox="0 0 100 104" aria-label="Seven day evaluation score trend" role="img"><defs><linearGradient id="trend-gradient" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#7a8cff" stopOpacity=".22" /><stop offset="100%" stopColor="#7a8cff" stopOpacity="0" /></linearGradient></defs><path d={`M ${areaPoints}`} fill="url(#trend-gradient)" /><polyline fill="none" points={points} stroke="#8b9aff" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.4" /><circle cx="100" cy="45" fill="#0d1119" r="2.7" stroke="#8b9aff" strokeWidth="1.4" /></svg>
@@ -396,10 +452,10 @@ function TrendPanel() {
 }
 
 function ModelPanel() {
-  const models = [{ name: 'Atlas 3.1', score: 92.8, cases: '1,200', color: 'cyan' }, { name: 'Atlas 3.0', score: 86.4, cases: '1,920', color: 'violet' }, { name: 'Nimbus 2.8', score: 74.6, cases: '720', color: 'amber' }]
+   const models = [{ name: 'safe-sample-agent', score: 100, cases: '3 safe paths', color: 'cyan' }, { name: 'defective-sample-agent', score: 0, cases: '1 defect path', color: 'amber' }]
   return (
     <section className="panel model-panel">
-      <div className="panel-heading"><div><span className="section-kicker">Model comparison</span><h2>By model</h2></div><button aria-label="Model comparison options" className="icon-button subtle-icon" type="button"><Icon name="more" size={17} /></button></div>
+      <div className="panel-heading"><div><span className="section-kicker">Agent comparison</span><h2>By integration</h2></div><button aria-label="Agent comparison options" className="icon-button subtle-icon" type="button"><Icon name="more" size={17} /></button></div>
       <div className="model-list">{models.map((model) => <div className="model-row" key={model.name}><span className={`model-bullet bullet-${model.color}`} /><span className="model-name"><strong>{model.name}</strong><small>{model.cases} cases</small></span><span className="model-score"><strong>{model.score}%</strong><span className="mini-track"><span className={`mini-fill fill-${model.color}`} style={{ width: `${model.score}%` }} /></span></span></div>)}</div>
       <div className="model-footer"><span><span className="legend-dot dot-cyan" /> Best performing</span><span>Local demo snapshot</span></div>
     </section>
@@ -425,17 +481,17 @@ function RunDetail({ run, onBack }: { run: Run; onBack: () => void }) {
       </div>
       <div className="run-detail-grid">
         <section className="panel evaluators-panel">
-          <div className="panel-heading"><div><span className="section-kicker">Evaluation signals</span><h2>Evaluator breakdown</h2></div><span className="muted-label">4 evaluators</span></div>
+          <div className="panel-heading"><div><span className="section-kicker">Independent checks</span><h2>Evaluator breakdown</h2></div><span className="muted-label">4 invariants</span></div>
           <div className="evaluator-list">{demoEvaluators.map((evaluator) => <EvaluatorRow evaluator={evaluator} key={evaluator.name} />)}</div>
         </section>
         <section className="panel config-panel">
           <div className="panel-heading"><div><span className="section-kicker">Run context</span><h2>Configuration</h2></div><button aria-label="Configuration options" className="icon-button subtle-icon" type="button"><Icon name="more" size={17} /></button></div>
-          <dl className="config-list"><div><dt>Model</dt><dd>{run.model}<small>{run.modelVersion}</small></dd></div><div><dt>Dataset</dt><dd>{run.dataset}<small>v4 · 480 records</small></dd></div><div><dt>Evaluator set</dt><dd>verity-standard<small>4 active evaluators</small></dd></div><div><dt>Environment</dt><dd><span className="environment-dot" /> Local demo<small>API not connected</small></dd></div></dl>
+          <dl className="config-list"><div><dt>Agent</dt><dd>{run.model}<small>{run.modelVersion}</small></dd></div><div><dt>Scenario</dt><dd>{run.dataset}<small>deterministic simulated payment</small></dd></div><div><dt>Evidence</dt><dd>ledger + trace<small>independent evaluator</small></dd></div><div><dt>Execution</dt><dd><span className="environment-dot" /> Local safe mode<small>untrusted code disabled</small></dd></div></dl>
         </section>
       </div>
       <section className="evidence-panel">
         <div className="evidence-mark"><Icon name="shield" size={18} /></div>
-        <div><span className="section-kicker">Evidence preview</span><h2>Every score should be explainable.</h2><p>Trace-level evidence will appear here when the evaluation API is connected. The demo shell keeps this state explicit rather than fabricating model output.</p></div>
+         <div><span className="section-kicker">Evidence preview</span><h2>Every result should be explainable.</h2><p>Trace-level events, ledger entries, failed invariants, and grounded recommendations are derived from the deterministic engine.</p></div>
         <button className="text-button" type="button">Learn about traces <Icon name="external-link" size={14} /></button>
       </section>
     </>
@@ -451,6 +507,10 @@ function EvaluatorRow({ evaluator }: { evaluator: EvaluatorResult }) {
       <Icon name="chevron-right" size={16} className="row-chevron" />
     </div>
   )
+}
+
+function App() {
+  return <BrowserRouter><Workspace /></BrowserRouter>
 }
 
 export default App
