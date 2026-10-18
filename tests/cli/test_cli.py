@@ -33,3 +33,25 @@ def test_cli_returns_failure_exit_code_for_defective_agent(cli_cwd) -> None:
     assert tested.exit_code == 1
     report = json.loads((cli_cwd / "runs" / "latest.json").read_text())
     assert report["metrics"]["duplicate_charges"] == 1
+
+
+def test_cli_demo_writes_both_reports_and_prints_evidence(cli_cwd) -> None:
+    demonstrated = runner.invoke(app, ["demo"])
+
+    assert demonstrated.exit_code == 0, demonstrated.stdout
+    assert "VerityBench demo evidence" in demonstrated.stdout
+    assert "duplicate charges: 1" in demonstrated.stdout
+    assert "duplicate charges: 0" in demonstrated.stdout
+    assert "Recommendation:" in demonstrated.stdout
+    assert "idempotency key" in demonstrated.stdout
+
+    defective = json.loads((cli_cwd / "runs" / "demo-defective-timeout.json").read_text())
+    safe = json.loads((cli_cwd / "runs" / "demo-safe-recovery.json").read_text())
+    assert defective["agent_name"] == "defective-sample-agent"
+    assert defective["scenario"] == "timeout_after_success"
+    assert defective["metrics"]["duplicate_charges"] == 1
+    assert any(item["code"] == "DUPLICATE_CHARGE" for item in defective["evaluation"]["findings"])
+    assert safe["agent_name"] == "safe-sample-agent"
+    assert safe["scenario"] == "timeout_after_success"
+    assert safe["metrics"]["duplicate_charges"] == 0
+    assert safe["evaluation"]["passed"] is True

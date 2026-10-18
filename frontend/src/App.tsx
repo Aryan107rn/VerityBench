@@ -182,7 +182,7 @@ function StatusBadge({ status }: { status: Run['status'] }) {
 }
 
 function DemoPill({ apiStatus, apiMode }: { apiStatus: 'checking' | 'online' | 'offline'; apiMode: boolean }) {
-  const label = apiMode ? 'Live API data' : apiStatus === 'offline' ? 'Offline demo fixtures' : apiStatus === 'checking' ? 'Checking API' : 'Local demo fixtures'
+  const label = apiMode ? 'Live API · persisted' : apiStatus === 'offline' ? 'Offline demo · fixtures' : apiStatus === 'checking' ? 'Checking API' : 'Demo fallback · fixtures'
   return (
     <span className={`demo-pill ${apiMode ? 'demo-pill-live' : ''}`}>
       <span className="demo-pulse" />
@@ -220,6 +220,7 @@ function Workspace() {
   const [runComposerOpen, setRunComposerOpen] = useState(false)
   const [runBusy, setRunBusy] = useState(false)
   const [runComposerError, setRunComposerError] = useState('')
+  const [demoBannerVisible, setDemoBannerVisible] = useState(true)
 
   const token = session?.token ?? null
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
@@ -409,7 +410,7 @@ function Workspace() {
           <span className="workspace-avatar">{selectedProject?.name.slice(0, 1).toUpperCase() ?? 'V'}</span>
           <span className="workspace-copy">
             <span className="workspace-label">Workspace</span>
-            <strong>{selectedProject?.name ?? 'local demo workspace'}</strong>
+            <strong>{selectedProject?.name ?? 'demo fallback workspace'}</strong>
           </span>
           <Icon name="chevron-down" size={15} />
         </div>
@@ -456,7 +457,7 @@ function Workspace() {
             <div aria-label={`${apiMode ? displayRuns.length : 4} available runs`} className="progress-track" role="progressbar">
               <span className="progress-fill usage-fill" style={{ width: `${apiMode ? Math.min(100, displayRuns.length * 10) : 32}%` }} />
             </div>
-            <span className="usage-footnote">{apiMode ? 'persisted API runs' : 'offline demo fixtures'}</span>
+            <span className="usage-footnote">{apiMode ? 'persisted API runs' : 'read-only demo fixtures'}</span>
           </div>
           <div className="user-row">
             <span className="user-avatar">{session ? session.user.email.slice(0, 2).toUpperCase() : 'DE'}</span>
@@ -505,15 +506,15 @@ function Workspace() {
             selectedProjectId={selectedProjectId}
             session={session}
           />
-          <div className={`demo-banner ${apiMode ? 'demo-banner-live' : ''}`}>
+          {demoBannerVisible && <div className={`demo-banner ${apiMode ? 'demo-banner-live' : ''}`}>
             <Icon name={apiMode ? 'shield' : 'sparkles'} size={16} />
             <span>
-              <strong>{apiMode ? 'Live persisted API data' : apiStatus === 'offline' ? 'Offline demo fixtures' : 'Local demo fixtures'}</strong>
+              <strong>{apiMode ? 'Live persisted API data' : apiStatus === 'offline' ? 'Offline demo fallback' : 'Demo fallback · local fixtures'}</strong>
               {' · '}
-              {apiMode ? 'Runs, metrics, reports, and evidence are loaded from the selected project.' : 'Only repository-owned sample agents are represented here; imported code is disabled.'}
+              {apiMode ? 'Runs, metrics, reports, and evidence are loaded from the selected project.' : apiStatus === 'offline' ? 'The API is unreachable; browse repository-owned reports without writing data.' : 'Sign in to run against the API; local fixtures are read-only and never persisted.'}
             </span>
-            <button aria-label="Dismiss demo data notice" className="banner-dismiss" type="button">×</button>
-          </div>
+            <button aria-label="Dismiss demo data notice" className="banner-dismiss" onClick={() => setDemoBannerVisible(false)} type="button">×</button>
+          </div>}
 
           {runError && apiMode && <div className="inline-error" role="alert">{runError}</div>}
           {view === 'overview' && <Overview apiData={apiMode} apiRuns={apiRuns} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} runs={displayRuns} stats={apiStats} trend={trend} />}

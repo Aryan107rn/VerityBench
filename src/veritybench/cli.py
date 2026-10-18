@@ -34,6 +34,8 @@ app = typer.Typer(
 CONFIG_FILE = Path("veritybench.toml")
 RUNS_DIR = Path("runs")
 SESSION_FILE = Path.home() / ".config" / "veritybench" / "session.json"
+DEMO_DEFECTIVE_REPORT = RUNS_DIR / "demo-defective-timeout.json"
+DEMO_SAFE_REPORT = RUNS_DIR / "demo-safe-recovery.json"
 
 
 def _fail(message: str, code: int = 2) -> NoReturn:
@@ -156,6 +158,54 @@ def test(
         typer.echo(f"Report: {output}")
     if not result.evaluation.passed:
         raise typer.Exit(1)
+
+
+@app.command()
+def demo() -> None:
+    """Run the timeout defect and safe recovery demo in one command.
+
+    This expected-failure demonstration exits successfully after writing both
+    reports, so it can be used as a concise hackathon evidence workflow.
+    """
+
+    scenario = FaultScenario.TIMEOUT_AFTER_SUCCESS
+    defective = simulate(
+        scenario,
+        agent=DefectiveSampleAgent(),
+        config=SimulationConfig(scenario=scenario),
+    )
+    safe = simulate(
+        scenario,
+        agent=SafeSampleAgent(),
+        config=SimulationConfig(scenario=scenario),
+    )
+    _write_report(defective, DEMO_DEFECTIVE_REPORT)
+    _write_report(safe, DEMO_SAFE_REPORT)
+
+    typer.echo("VerityBench demo evidence")
+    for label, result, output in (
+        ("Defective timeout", defective, DEMO_DEFECTIVE_REPORT),
+        ("Safe recovery", safe, DEMO_SAFE_REPORT),
+    ):
+        status = "PASS" if result.evaluation.passed else "FAIL (expected defect)"
+        typer.echo(
+            f"- {label}: {status} | duplicate charges: {result.metrics.duplicate_charges}"
+        )
+        recommendation = next(
+            (
+                finding.recommendation
+                for finding in result.evaluation.findings
+                if finding.code == "DUPLICATE_CHARGE"
+            ),
+            None,
+        )
+        if recommendation is None and result.evaluation.findings:
+            recommendation = result.evaluation.findings[0].recommendation
+        typer.echo(
+            "  Recommendation: "
+            + (recommendation or "preserve the original idempotency key during recovery.")
+        )
+        typer.echo(f"  Report: {output}")
 
 
 def _read_report(path: Path) -> dict[str, Any]:

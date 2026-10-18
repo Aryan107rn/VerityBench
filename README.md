@@ -36,6 +36,7 @@ python -m pip install -e .
 
 veritybench init
 veritybench validate
+veritybench demo
 veritybench test --scenario timeout_after_success --agent safe --json
 veritybench test --scenario timeout_after_success --agent defective --json
 veritybench report runs/latest.json
@@ -52,6 +53,9 @@ cd frontend && npm ci && npm run dev
 Open <http://localhost:5173>. The frontend is usable offline with clearly
 labelled local demo fixtures and switches to the API when the endpoint is
 available. API health is at <http://localhost:8000/health>.
+
+For the exact hackathon pitch, demo sequence, expected evidence, and submission
+checklist, see [HACKATHON.md](HACKATHON.md).
 
 ## Test and quality checks
 
