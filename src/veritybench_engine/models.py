@@ -71,6 +71,10 @@ class TraceEventType(str, Enum):
     ORDER_CANCELLED = "order_cancelled"
 
 
+ExecutionEventType = TraceEventType
+EXECUTION_EVENT_SCHEMA_VERSION = 1
+
+
 class LedgerEntryType(str, Enum):
     CHARGE = "charge"
     REVERSAL = "reversal"
@@ -167,18 +171,21 @@ class Ledger:
 
 
 @dataclass(frozen=True, slots=True)
-class TraceEvent:
-    """A structured, deterministic event in the simulation trace."""
+class ExecutionEvent:
+    """A versioned, structured, deterministic event in an execution trace."""
 
     index: int
     tick: int
     event_type: TraceEventType
     order_id: str
     attributes: Mapping[str, JSONPrimitive] = field(default_factory=dict)
+    schema_version: int = EXECUTION_EVENT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if self.index < 0 or self.tick < 0:
             raise ValueError("trace index and tick must not be negative")
+        if self.schema_version < 1:
+            raise ValueError("execution event schema_version must be positive")
         object.__setattr__(self, "attributes", MappingProxyType(dict(self.attributes)))
 
     @property
@@ -187,14 +194,31 @@ class TraceEvent:
 
         return self.event_type
 
+    @property
+    def sequence(self) -> int:
+        """Execution-wide ordering alias used by persisted event consumers."""
+
+        return self.index
+
+    @property
+    def payload(self) -> Mapping[str, JSONPrimitive]:
+        """Structured attribute alias used by event-stream consumers."""
+
+        return self.attributes
+
     def to_dict(self) -> dict[str, object]:
         return {
+            "schema_version": self.schema_version,
             "index": self.index,
             "tick": self.tick,
             "event_type": self.event_type.value,
             "order_id": self.order_id,
             "attributes": dict(self.attributes),
         }
+
+
+# TraceEvent remains the public name used by existing engine consumers.
+TraceEvent = ExecutionEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +326,7 @@ class SimulationResult:
     scenario: FaultScenario
     order: Order
     ledger: Ledger
-    trace: tuple[TraceEvent, ...]
+    trace: tuple[ExecutionEvent, ...]
     metrics: Metrics
     evaluation: EvaluationReport
 

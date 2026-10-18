@@ -1,13 +1,16 @@
 """Public API for the deterministic VerityBench shared testing engine."""
 
 from .agents import Agent, DefectiveAgent, DefectiveSampleAgent, SafeAgent, SafeSampleAgent
-from .engine import DeterministicEngine, simulate
+from .engine import DeterministicEngine, ExecutionCancelled, simulate
 from .evaluation import compute_metrics, evaluate_state
 from .models import (
+    EXECUTION_EVENT_SCHEMA_VERSION,
     AgentAction,
     AgentContext,
     AgentDecision,
     EvaluationReport,
+    ExecutionEvent,
+    ExecutionEventType,
     FaultScenario,
     Finding,
     FindingSeverity,
@@ -35,6 +38,10 @@ __all__ = [
     "DefectiveAgent",
     "DefectiveSampleAgent",
     "DeterministicEngine",
+    "ExecutionCancelled",
+    "ExecutionEvent",
+    "ExecutionEventType",
+    "EXECUTION_EVENT_SCHEMA_VERSION",
     "EvaluationReport",
     "FaultScenario",
     "Finding",

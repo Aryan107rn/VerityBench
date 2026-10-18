@@ -10,19 +10,25 @@ The product has a local CLI and a browser workspace. Local reports are written
 as JSON; authenticated browser runs are persisted by the API and can be opened
 again from the selected project.
 
-## Safe sample scope
+## Agent execution scope
 
-This release executes only the two repository-owned deterministic sample agents:
+The repository-owned deterministic sample agents are available locally and
+through the API:
 
 - `safe-sample-agent` reconciles an uncertain payment using the original
   idempotency key before fulfillment.
 - `defective-sample-agent` demonstrates the duplicate-payment defect by retrying
   a lost response with a new key.
 
-User-supplied Python, ZIP uploads, GitHub imports, arbitrary HTTP agents,
-external URLs, and real payment systems are not executed by this MVP. The API
-rejects unsupported agent modes. This is an intentional boundary until a
-dedicated sandbox is available.
+The CLI also supports a local Python agent module through `--agent-path`. The
+module must implement the versioned contract in
+[docs/AGENT_CONTRACT.md](docs/AGENT_CONTRACT.md), and it is loaded only in a
+bounded subprocess. Custom Python is CLI-local-only: the FastAPI process does
+not import or execute it, and API runs continue to accept only the sample
+agents. This worker is a process boundary, not a hostile-code sandbox; run
+only code you trust and do not put API credentials in the agent directory.
+ZIP uploads, GitHub imports, arbitrary HTTP agents, external URLs, and real
+payment systems remain unsupported.
 
 ## Quick start
 
@@ -86,17 +92,25 @@ The CLI operates locally and does not require login for local evaluation:
 veritybench init                         # create veritybench.toml and runs/
 veritybench validate                     # check the local configuration
 veritybench test --scenario normal --agent safe
+veritybench test --scenario all --agent safe
+veritybench test --scenario timeout_after_success \
+  --agent-path examples/agents/template_agent.py
 veritybench report runs/latest.json      # summarize a saved report
-veritybench runs                          # list JSON reports in runs/
+veritybench agents list                  # show sample and local agent modes
+veritybench scenarios list               # show deterministic scenarios
+veritybench runs list                    # list JSON reports in runs/
+veritybench runs show runs/latest.json   # inspect one saved report
 veritybench export runs/latest.json --output report.json
 ```
 
 `veritybench test` returns exit code 1 when the independent evaluation fails;
-that is expected for the defective timeout example. `veritybench demo` is the
-exception: it writes both the expected failing defective report and the passing
-safe report, then exits successfully. See the
-[development guide](docs/DEVELOPMENT.md) for every option, including `--json`,
-custom output paths, `login`, and `sync`.
+that is expected for the defective timeout example. A local worker timeout
+returns 124, while an invalid contract or worker refusal returns 2. `--json`
+prints only the report JSON on stdout; a normal local-agent run prints live
+engine events before its summary. `veritybench demo` is the exception: it
+writes both the expected failing defective report and the passing safe report,
+then exits successfully. See the [development guide](docs/DEVELOPMENT.md) and
+[Python agent contract](docs/AGENT_CONTRACT.md) for every option.
 
 ## Test and quality checks
 

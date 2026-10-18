@@ -46,9 +46,11 @@ Typer CLI ───────────────────────�
 ## State and persistence
 
 Runs have explicit states: `queued`, `running`, `passed`, `failed`,
-`cancelled`, `timed_out`, and `inconclusive`. The MVP executes a bounded
-scenario synchronously behind a short API request; the service boundary is
-designed so a queue/worker can replace the executor without changing reports.
+`cancelled`, `timed_out`, and `inconclusive`. The API creates a queued run and
+submits a bounded repository-owned execution to a background worker thread.
+Engine and lifecycle events are persisted in `run_events` and exposed through
+authenticated history and SSE endpoints. A durable external queue is still
+required for multi-process production scale.
 
 SQLite is the default local database. SQLAlchemy models use portable types and
 queries so PostgreSQL can be selected with `DATABASE_URL`. Alembic is the
@@ -57,11 +59,13 @@ database has no tables.
 
 ## Execution safety boundary
 
-The MVP does not execute user source, uploaded archives, package installers,
-arbitrary shell commands, model-provided tools, or user-provided URLs. Any
-future untrusted runner must be a separate unprivileged worker with no Docker
-socket, no host credentials, read-only base filesystem, resource limits, and
-network deny-by-default policy. See the threat model before enabling it.
+The API does not execute user source, uploaded archives, package installers,
+arbitrary shell commands, model-provided tools, or user-provided URLs. Trusted
+local Python modules can be run from the CLI in a bounded subprocess, but that
+boundary is not a hostile-code sandbox. Any future web BYOA runner must be a
+separate unprivileged worker with no Docker socket, no host credentials,
+read-only base filesystem, resource limits, and network deny-by-default policy.
+See the threat model before enabling it.
 
 ## Scale boundary
 

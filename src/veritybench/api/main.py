@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from typing import cast
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -20,23 +22,25 @@ from veritybench_engine import (
     DefectiveSampleAgent,
     DeterministicEngine,
     SafeSampleAgent,
-    SimulationConfig,
 )
 
 from .. import __version__
 from ..auth import hash_password, issue_session, revoke_session, verify_password
 from ..config import get_settings
-from ..db import get_db, init_db
+from ..db import SessionLocal, get_db, init_db
 from ..db_types import RunState
-from ..models import Project, Run, User
+from ..execution import append_run_event, run_event_lock, submit_run
+from ..models import Project, Run, RunEvent, User
 from ..rate_limit import AuthRateLimiter
 from ..schemas import (
+    AgentMetadata,
     HealthResponse,
     LoginRequest,
     ProjectCreateRequest,
     ProjectResponse,
     RegisterRequest,
     RunCreateRequest,
+    RunEventResponse,
     RunResponse,
     RunSummary,
     SessionResponse,
@@ -52,6 +56,24 @@ SAMPLE_AGENT_FACTORIES: dict[str, SampleAgentFactory] = {
     "safe": SafeSampleAgent,
     "defective": DefectiveSampleAgent,
 }
+SAMPLE_AGENT_METADATA = [
+    AgentMetadata(
+        key="safe",
+        name="safe-sample-agent",
+        description="Reconciles uncertain payments before fulfillment.",
+        source="repository",
+        runnable=True,
+        supported_scenarios=["normal", "timeout_after_success", "malformed_response", "temporary_failure", "unrecoverable_failure"],
+    ),
+    AgentMetadata(
+        key="defective",
+        name="defective-sample-agent",
+        description="Demonstrates duplicate-payment behavior for evaluator testing.",
+        source="repository",
+        runnable=True,
+        supported_scenarios=["normal", "timeout_after_success", "malformed_response", "temporary_failure", "unrecoverable_failure"],
+    ),
+]
 
 app = FastAPI(
     title="VerityBench API",
@@ -221,18 +243,42 @@ def _run_response(run: Run) -> RunResponse:
         state=run.state,
         agent=run.agent,
         scenario=run.scenario,
+        cancel_requested=run.cancel_requested,
         created_at=run.created_at,
+        started_at=run.started_at,
         completed_at=run.completed_at,
         report=report,
         error_message=run.error_message,
     )
 
 
+def _run_event_response(event: RunEvent) -> RunEventResponse:
+    payload = json.loads(event.payload_json)
+    if not isinstance(payload, dict):
+        payload = {}
+    return RunEventResponse(
+        id=event.id,
+        run_id=event.run_id,
+        sequence=event.sequence,
+        schema_version=event.schema_version,
+        event_type=event.event_type,
+        payload=cast(dict[str, object], payload),
+        created_at=event.created_at,
+    )
+
+
+def _owned_run(run_id: str, user: User, db: Session) -> Run:
+    run = db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
+    owned_project(run.project_id, user, db)
+    return run
+
+
 @app.post("/api/v1/projects/{project_id}/runs", response_model=RunResponse, status_code=status.HTTP_201_CREATED)
 def create_run(
     project_id: str,
     payload: RunCreateRequest,
-    request: Request,
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> RunResponse:
@@ -247,25 +293,27 @@ def create_run(
         agent=payload.agent,
         scenario=payload.scenario.value,
     )
-    db.add(run)
-    db.commit()
+    with run_event_lock:
+        db.add(run)
+        append_run_event(
+            db,
+            run.id,
+            "run_queued",
+            {
+                "state": RunState.QUEUED.value,
+                "agent": payload.agent,
+                "scenario": payload.scenario.value,
+            },
+        )
+        db.commit()
     db.refresh(run)
-    run.state = RunState.RUNNING
-    db.commit()
-    try:
-        selected_agent = agent_factory()
-        result = DeterministicEngine(
-            SimulationConfig(scenario=payload.scenario, max_steps=settings.veritybench_max_run_steps)
-        ).run(selected_agent)
-        run.report_json = json.dumps(result.to_dict(), sort_keys=True)
-        run.state = RunState.PASSED if result.evaluation.passed else RunState.FAILED
-    except Exception as exc:  # bounded engine errors become explicit inconclusive runs
-        logger.exception("run execution failed", extra={"request_id": request.state.request_id, "run_id": run.id})
-        run.state = RunState.INCONCLUSIVE
-        run.error_message = f"execution failed: {type(exc).__name__}"
-    run.completed_at = datetime.now(UTC)
-    db.commit()
-    db.refresh(run)
+    submit_run(
+        run.id,
+        payload.scenario,
+        agent_factory,
+        settings.veritybench_max_run_steps,
+        engine_factory=DeterministicEngine,
+    )
     return _run_response(run)
 
 
@@ -293,8 +341,122 @@ def list_runs(
 
 @app.get("/api/v1/runs/{run_id}", response_model=RunResponse)
 def get_run(run_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> RunResponse:
-    run = db.get(Run, run_id)
-    if run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
-    owned_project(run.project_id, user, db)
+    return _run_response(_owned_run(run_id, user, db))
+
+
+@app.get("/api/v1/projects/{project_id}/agents", response_model=list[AgentMetadata])
+def list_agents(
+    project_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[AgentMetadata]:
+    owned_project(project_id, user, db)
+    return SAMPLE_AGENT_METADATA
+
+
+@app.get("/api/v1/runs/{run_id}/events", response_model=list[RunEventResponse])
+def list_run_events(
+    run_id: str,
+    after_sequence: int = -1,
+    limit: int = 100,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[RunEventResponse]:
+    _owned_run(run_id, user, db)
+    bounded_limit = min(max(limit, 1), 500)
+    return [
+        _run_event_response(event)
+        for event in db.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == run_id, RunEvent.sequence > max(after_sequence, -1))
+            .order_by(RunEvent.sequence.asc())
+            .limit(bounded_limit)
+        )
+    ]
+
+
+@app.post("/api/v1/runs/{run_id}/cancel", response_model=RunResponse)
+def cancel_run(
+    run_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> RunResponse:
+    run = _owned_run(run_id, user, db)
+    terminal_states = {
+        RunState.PASSED,
+        RunState.FAILED,
+        RunState.CANCELLED,
+        RunState.TIMED_OUT,
+        RunState.INCONCLUSIVE,
+    }
+    if run.state not in terminal_states:
+        with run_event_lock:
+            if not run.cancel_requested:
+                run.cancel_requested = True
+                append_run_event(
+                    db,
+                    run.id,
+                    "run_cancel_requested",
+                    {"state": run.state, "cancel_requested": True},
+                )
+            if run.state == RunState.QUEUED:
+                run.state = RunState.CANCELLED
+                run.completed_at = datetime.now(UTC)
+                append_run_event(
+                    db,
+                    run.id,
+                    "run_cancelled",
+                    {"state": RunState.CANCELLED.value, "reason": "cancelled while queued"},
+                )
+            db.commit()
+        db.refresh(run)
     return _run_response(run)
+
+
+def _event_stream(run_id: str, after_sequence: int) -> Iterator[str]:
+    sequence = max(after_sequence, -1)
+    while True:
+        with SessionLocal() as db:
+            run = db.get(Run, run_id)
+            if run is None:
+                return
+            events = list(
+                db.scalars(
+                    select(RunEvent)
+                    .where(RunEvent.run_id == run_id, RunEvent.sequence > sequence)
+                    .order_by(RunEvent.sequence.asc())
+                )
+            )
+            terminal = run.state in {
+                RunState.PASSED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+                RunState.TIMED_OUT,
+                RunState.INCONCLUSIVE,
+            }
+        for event in events:
+            response = _run_event_response(event).model_dump(mode="json")
+            yield (
+                f"id: {event.sequence}\n"
+                f"event: {event.event_type}\n"
+                f"data: {json.dumps(response, sort_keys=True)}\n\n"
+            )
+            sequence = event.sequence
+        if terminal:
+            return
+        time.sleep(0.05)
+
+
+@app.get("/api/v1/runs/{run_id}/events/stream")
+def stream_run_events(
+    run_id: str,
+    after_sequence: int = -1,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    _owned_run(run_id, user, db)
+    return StreamingResponse(
+        _event_stream(run_id, after_sequence),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

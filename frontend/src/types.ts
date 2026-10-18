@@ -1,4 +1,4 @@
-export type View = 'overview' | 'dashboard' | 'run' | 'datasets' | 'evaluators' | 'settings' | 'cli'
+export type View = 'overview' | 'dashboard' | 'run' | 'agents' | 'datasets' | 'evaluators' | 'settings' | 'cli'
 
 export type RunStatus = 'completed' | 'running' | 'needs-review'
 

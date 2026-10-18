@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
+import { AgentsPage } from './components/AgentsPage'
 import { Icon, type IconName } from './components/Icon'
+import { RunExecutionView } from './components/RunExecutionView'
 import { demoCoverage, demoEvaluators, demoRuns } from './data/demo'
 import {
   createApiClient,
   type ApiClient,
+  type ApiAgent,
   type ApiEvaluation,
   type ApiProject,
   type ApiReport,
@@ -46,6 +49,7 @@ const settingsStorageKey = 'veritybench.local-settings'
 const navItems: Array<{ id: View; label: string; icon: IconName; path: string }> = [
   { id: 'overview', label: 'Overview', icon: 'layers', path: '/' },
   { id: 'dashboard', label: 'Agent runs', icon: 'activity', path: '/runs' },
+  { id: 'agents', label: 'Agents', icon: 'sparkles', path: '/agents' },
   { id: 'datasets', label: 'Datasets', icon: 'database', path: '/datasets' },
   { id: 'evaluators', label: 'Evaluators', icon: 'sliders', path: '/evaluators' },
   { id: 'settings', label: 'Settings', icon: 'settings', path: '/settings' },
@@ -56,6 +60,7 @@ const viewLabels: Record<View, string> = {
   overview: 'Overview',
   dashboard: 'Agent runs',
   run: 'Run detail',
+  agents: 'Agents',
   datasets: 'Datasets',
   evaluators: 'Evaluators',
   settings: 'Settings',
@@ -247,6 +252,7 @@ function buildTrend(runs: Run[]): TrendPoint[] {
 function pageForPath(pathname: string): View {
   if (pathname === '/runs') return 'dashboard'
   if (pathname.startsWith('/runs/')) return 'run'
+  if (pathname === '/agents') return 'agents'
   if (pathname === '/datasets') return 'datasets'
   if (pathname === '/evaluators') return 'evaluators'
   if (pathname === '/settings') return 'settings'
@@ -286,6 +292,9 @@ function Workspace() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() => readStoredProject())
   const [projectsLoading, setProjectsLoading] = useState(false)
   const [projectError, setProjectError] = useState('')
+  const [apiAgents, setApiAgents] = useState<ApiAgent[]>([])
+  const [agentsLoading, setAgentsLoading] = useState(false)
+  const [agentsError, setAgentsError] = useState('')
   const [apiRuns, setApiRuns] = useState<ApiRun[]>([])
   const [runsLoading, setRunsLoading] = useState(false)
   const [runError, setRunError] = useState('')
@@ -336,6 +345,7 @@ function Workspace() {
       setProjects([])
       setSelectedProjectId(null)
       saveStoredProject(null)
+      setApiAgents([])
       setApiRuns([])
       return
     }
@@ -354,6 +364,24 @@ function Workspace() {
     }).finally(() => active && setProjectsLoading(false))
     return () => { active = false }
   }, [api, token])
+
+  useEffect(() => {
+    let active = true
+    if (!token || !selectedProjectId || apiStatus !== 'online') {
+      setApiAgents([])
+      setAgentsError('')
+      setAgentsLoading(false)
+      return
+    }
+    setAgentsLoading(true)
+    setAgentsError('')
+    api.listAgents(token, selectedProjectId).then((agents) => {
+      if (active) setApiAgents(agents)
+    }).catch((error: unknown) => {
+      if (active) setAgentsError(error instanceof Error ? error.message : 'Could not load project agents.')
+    }).finally(() => active && setAgentsLoading(false))
+    return () => { active = false }
+  }, [api, apiStatus, selectedProjectId, token])
 
   useEffect(() => {
     let active = true
@@ -439,10 +467,9 @@ function Workspace() {
     setRunComposerError('')
     try {
       const created = await api.createRun(token, selectedProjectId, agent, scenario)
-      const persisted = await api.getApiRun(token, created.id)
-      setApiRuns((current) => [persisted, ...current.filter((run) => run.id !== persisted.id)])
+      setApiRuns((current) => [created, ...current.filter((run) => run.id !== created.id)])
       setRunComposerOpen(false)
-      navigate(`/runs/${encodeURIComponent(persisted.id)}`)
+      navigate(`/runs/${encodeURIComponent(created.id)}`)
     } catch (error: unknown) {
       setRunComposerError(error instanceof Error ? error.message : 'The API could not persist this run.')
     } finally {
@@ -481,7 +508,7 @@ function Workspace() {
           <span className="nav-section-label">Workspace</span>
           {navItems.slice(0, 2).map((item) => <NavItem active={view === item.id || (view === 'run' && item.id === 'dashboard')} count={item.id === 'dashboard' ? displayRuns.length : undefined} item={item} key={item.id} onNavigate={setView} />)}
           <span className="nav-section-label nav-section-spaced">Configure</span>
-          {navItems.slice(2, 6).map((item) => <NavItem active={view === item.id} item={item} key={item.id} onNavigate={setView} />)}
+          {navItems.slice(2, 7).map((item) => <NavItem active={view === item.id} item={item} key={item.id} onNavigate={setView} />)}
         </nav>
         <div className="sidebar-bottom">
           <div className="sidebar-note"><span className="note-mark" /><span><strong>{apiMode ? 'Connected workspace' : 'Local-first preview'}</strong><small>{apiMode ? 'Protected API data' : 'Fixtures stay in your browser'}</small></span></div>
@@ -509,7 +536,8 @@ function Workspace() {
           {runError && apiMode && <div className="inline-error" role="alert">{runError}</div>}
           {view === 'overview' && <Overview apiData={apiMode} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} runs={displayRuns} stats={stats} trend={trend} />}
           {view === 'dashboard' && <Dashboard apiData={apiMode} apiRuns={apiRuns} composerOpen={runComposerOpen} compactRows={localSettings.compactRows} onCancelRun={() => setRunComposerOpen(false)} onOpenRun={openRun} onRun={requestRun} onSubmitRun={submitRun} runBusy={runBusy} runComposerError={runComposerError} runs={displayRuns} stats={stats} trend={trend} />}
-          {view === 'run' && <RunDetail apiRun={apiMode ? selectedApiRun : null} loading={apiMode && runsLoading && !selectedApiRun} onBack={() => setView('dashboard')} run={selectedRun} />}
+           {view === 'run' && <RunDetail api={api} apiRun={apiMode ? selectedApiRun : null} loading={apiMode && runsLoading && !selectedApiRun} onBack={() => setView('dashboard')} onRunUpdated={(nextRun) => setApiRuns((current) => [nextRun, ...current.filter((run) => run.id !== nextRun.id)])} run={selectedRun} token={token} />}
+           {view === 'agents' && <AgentsPage agents={apiAgents} apiData={apiMode} error={agentsError} loading={agentsLoading} onBrowseRuns={() => setView('dashboard')} onOpenCli={() => setView('cli')} onRetry={() => { if (token && selectedProjectId) { setAgentsLoading(true); api.listAgents(token, selectedProjectId).then(setApiAgents).catch((error: unknown) => setAgentsError(error instanceof Error ? error.message : 'Could not load project agents.')).finally(() => setAgentsLoading(false)) } }} />}
           {view === 'datasets' && <DatasetsPage datasets={localDatasets} onAdd={(dataset) => setLocalDatasets((current) => [...current, dataset])} onSelect={setView} />}
           {view === 'evaluators' && <EvaluatorsPage enabled={enabledEvaluators} onToggle={(id) => setEnabledEvaluators((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />}
           {view === 'settings' && <SettingsPage apiStatus={apiStatus} enabledEvaluators={enabledEvaluators.length} localSettings={localSettings} onCheck={() => { setApiStatus('checking'); api.getHealth().then(() => setApiStatus('online')).catch(() => setApiStatus('offline')) }} onReset={resetLocalConfig} onSettingsChange={updateLocalSettings} onThemeChange={setTheme} session={session} theme={theme} />}
@@ -637,8 +665,8 @@ function AgentComparison({ apiData, runs }: { apiData: boolean; runs: ApiRun[] }
   return <section className="panel comparison-panel"><div className="panel-heading"><div><span className="section-kicker">Agent comparison</span><h2>{apiData ? 'By persisted report' : 'By fixture run'}</h2></div><span className="muted-label">Average score</span></div><div className="comparison-list">{models.length ? models.map((model) => <div className="comparison-row" key={model.name}><span className={`model-bullet bullet-${model.color}`} /><span className="model-name"><strong>{model.name}</strong><small>{model.count} {model.count === 1 ? 'run' : 'runs'}</small></span><span className="model-score"><strong>{formatScore(model.score)}</strong><span className="mini-track"><span className={`mini-fill fill-${model.color}`} style={{ width: `${model.score ?? 0}%` }} /></span></span></div>) : <EmptyPanel description="No persisted reports to compare." />}</div><p className="panel-footnote">{apiData ? 'Averages are calculated from report evaluation invariants.' : 'Fixture comparison is read-only and not a backend claim.'}</p></section>
 }
 
-function RunDetail({ apiRun, loading, onBack, run }: { apiRun: ApiRun | null; loading: boolean; onBack: () => void; run: Run | null }) {
-  if (apiRun) return <ApiRunDetail apiRun={apiRun} onBack={onBack} />
+function RunDetail({ api, apiRun, loading, onBack, onRunUpdated, run, token }: { api: ApiClient; apiRun: ApiRun | null; loading: boolean; onBack: () => void; onRunUpdated: (run: ApiRun) => void; run: Run | null; token: string | null }) {
+  if (apiRun && token) return <RunExecutionView api={api} initialRun={apiRun} onBack={onBack} onRunUpdated={onRunUpdated} token={token} />
   if (loading) return <><BackButton onBack={onBack} /><div className="detail-loading">Loading persisted report…</div></>
   if (!run) return <><BackButton onBack={onBack} /><EmptyState title="Run not found" description="This run is not available in the selected project." actionLabel="Back to runs" onAction={onBack} /></>
   return <DemoRunDetail onBack={onBack} run={run} />

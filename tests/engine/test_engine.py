@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from veritybench_engine import (
+    EXECUTION_EVENT_SCHEMA_VERSION,
     DefectiveSampleAgent,
+    DeterministicEngine,
+    ExecutionEvent,
     FaultScenario,
     Ledger,
     LedgerEntry,
@@ -33,6 +36,17 @@ def test_normal_operation_fulfills_once_and_is_evaluated_from_ledger():
     assert result.metrics.ledger_charges == 1
     assert result.evaluation.passed
     assert TraceEventType.ORDER_FULFILLED in event_types(result)
+
+
+def test_engine_emits_versioned_events_in_trace_order() -> None:
+    emitted: list[ExecutionEvent] = []
+
+    result = DeterministicEngine().run(on_event=emitted.append)
+
+    assert emitted == list(result.trace)
+    assert [event.sequence for event in emitted] == list(range(len(emitted)))
+    assert all(event.schema_version == EXECUTION_EVENT_SCHEMA_VERSION for event in emitted)
+    assert emitted[0].payload == emitted[0].attributes
 
 
 def test_timeout_after_success_is_reconciled_without_a_second_charge():

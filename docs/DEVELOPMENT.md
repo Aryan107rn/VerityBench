@@ -88,6 +88,8 @@ and do not require a configuration file.
 veritybench init
 veritybench init --force       # replace an existing veritybench.toml
 veritybench validate
+veritybench agents list --json
+veritybench scenarios list --json
 ```
 
 `init` creates `veritybench.toml` and `runs/`. The generated project defaults
@@ -99,14 +101,24 @@ for `[project].agent`.
 
 ```bash
 veritybench test --scenario normal --agent safe
+veritybench test --scenario all --agent safe
 veritybench test --scenario timeout_after_success --agent safe --json
 veritybench test --scenario timeout_after_success --agent defective \
   --output runs/defective-timeout.json
+veritybench test --scenario timeout_after_success \
+  --agent-path examples/agents/template_agent.py
+veritybench test --agent-path ./my_agent.py --timeout 20 --json \
+  --output runs/my-agent.json
 ```
 
 `test` executes one bounded deterministic evaluation and writes
-`runs/latest.json` by default. Use `--scenario`, `--agent`, `--output`, and
+`runs/latest.json` by default. Use `--scenario all` to execute the five
+scenarios as a local suite. Use `--scenario`, `--agent`, `--output`, and
 `--json` to select the behavior, sample agent, destination, and output format.
+Use `--agent-path` instead of `--agent` to run a version-1 custom Python agent
+in a separate local subprocess. The default worker timeout is 10 seconds;
+`--timeout` changes it for trusted local code. A normal custom-agent run shows
+live engine events; `--json` prints only the final valid JSON report.
 The supported scenarios are:
 
 - `normal` — the payment succeeds normally.
@@ -117,6 +129,8 @@ The supported scenarios are:
 
 The command exits 0 for a passing evaluation and 1 when the independent
 evaluation finds a defect. The defective timeout run is expected to exit 1.
+Worker timeouts exit 124. Invalid contract modules, invalid paths, and other
+worker refusals exit 2 with a clear diagnostic.
 
 ### Compare both sample agents
 
@@ -136,14 +150,18 @@ veritybench report
 veritybench report runs/demo-defective-timeout.json
 veritybench report runs/latest.json --json
 veritybench runs
+veritybench runs list --json
+veritybench runs show runs/latest.json
+veritybench runs show runs/latest.json --json
 veritybench export runs/latest.json --output report.json
 ```
 
-`report [PATH]` reads one saved JSON report and prints its pass/fail status,
-metrics, findings, evidence, and recommendations; `--json` prints the report
-instead of the summary. `runs` lists every `*.json` report under `runs/` with a
-pass/fail label. `export [PATH] --output PATH` reads a report and copies it to a
-named JSON path; the defaults are `runs/latest.json` and `report.json`.
+`report [PATH]` and `runs show [PATH]` read one saved JSON report and print its
+pass/fail status, metrics, findings, evidence, and recommendations; `--json`
+prints the report instead of the summary. `runs` remains a shorthand for
+`runs list`, while `runs list --json` prints a JSON array of report summaries.
+`export [PATH] --output PATH` reads a report and copies it to a named JSON path;
+the defaults are `runs/latest.json` and `report.json`.
 
 ### Run through the authenticated API from the CLI
 
@@ -158,21 +176,23 @@ session token at `~/.config/veritybench/session.json` with mode `0600`.
 `sync` requires that login and a project ID, supplied with `--project-id` or
 `[api].project_id` in `veritybench.toml`; it prints the persisted API response
 and exits 1 when the API run is not passed. These commands still support only
-the two sample agents and the five local scenarios.
+the two sample agents and the five local scenarios. `--agent-path` is never
+forwarded to the API.
 
-## Safe sample limitation
+## Local Python agent boundary
 
-The CLI and API instantiate only `safe-sample-agent` and
-`defective-sample-agent`, both owned by this repository. They run against a
-local deterministic payment model; there are no real payment integrations or
-customer records. User Python, uploaded ZIPs, GitHub projects, arbitrary HTTP
-agents, and external URLs are rejected and must not be described as supported
-inputs. This boundary remains in place until an isolated sandbox exists.
+The versioned Python contract, copyable example, subprocess limits, structured
+event protocol, and diagnostics are documented in
+[AGENT_CONTRACT.md](AGENT_CONTRACT.md). Custom code runs only in the CLI's
+local worker. It is not loaded by FastAPI and is not a hostile-code sandbox:
+there are no network or filesystem restrictions inside the worker, so run
+trusted code and keep API credentials out of the agent directory. The API
+continues to instantiate only the repository-owned sample agents.
 
 ## Adding an adapter
 
-Implement the small typed `Agent` protocol in
-`src/veritybench_engine/agents.py`, keep it deterministic for tests, and add
-independent evaluator tests. Do not add a framework adapter that executes
-arbitrary source in the API process. A future adapter must declare its runtime,
-tools, limits, output schema, and isolation policy.
+Implement the documented local contract in a separate module, keep it
+deterministic for tests, and add independent evaluator tests. Do not add a
+framework adapter that executes arbitrary source in the API process. A future
+runtime must declare its contract version, tools, limits, output schema, and
+isolation policy.

@@ -5,12 +5,16 @@
 ```bash
 make test
 python -m pytest tests/engine tests/api tests/cli
+python -m pytest tests/cli -q
 ```
 
 The deterministic engine tests cover the safe timeout recovery, defective
 duplicate charge, malformed response, temporary retry, unrecoverable failure,
-independent evaluation, and repeatability requirements. API tests cover
-registration, protected project access, cross-user denial, and persisted runs.
+independent evaluation, and repeatability requirements. CLI tests cover sample
+regression, valid/invalid local-agent contracts, worker timeout and exception
+diagnostics, bounded subprocess JSON output, live events, and JSON catalog/run
+commands. API tests cover registration, protected project access, cross-user
+denial, and persisted runs.
 
 ## Security scans
 

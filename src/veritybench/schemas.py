@@ -109,10 +109,12 @@ class RunSummary(BaseModel):
     state: str
     agent: str
     scenario: str
+    cancel_requested: bool = False
     created_at: datetime
+    started_at: datetime | None = None
     completed_at: datetime | None = None
 
-    @field_validator("created_at", "completed_at", mode="after")
+    @field_validator("created_at", "started_at", "completed_at", mode="after")
     @classmethod
     def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
         return _as_utc(value) if value is not None else None
@@ -121,6 +123,30 @@ class RunSummary(BaseModel):
 class RunResponse(RunSummary):
     report: dict[str, object] | None = None
     error_message: str | None = None
+
+
+class RunEventResponse(BaseModel):
+    id: str
+    run_id: str
+    sequence: int
+    schema_version: int
+    event_type: str
+    payload: dict[str, object]
+    created_at: datetime
+
+    @field_validator("created_at", mode="after")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        return _as_utc(value)
+
+
+class AgentMetadata(BaseModel):
+    key: str
+    name: str
+    description: str
+    source: Literal["repository"]
+    runnable: bool
+    supported_scenarios: list[str]
 
 
 class HealthResponse(BaseModel):

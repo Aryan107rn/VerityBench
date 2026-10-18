@@ -35,6 +35,18 @@ def test_cli_returns_failure_exit_code_for_defective_agent(cli_cwd) -> None:
     assert report["metrics"]["duplicate_charges"] == 1
 
 
+def test_cli_runs_all_scenarios_and_streams_sample_events(cli_cwd) -> None:
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    tested = runner.invoke(app, ["test", "--scenario", "all", "--agent", "safe"])
+
+    assert tested.exit_code == 0, tested.stdout
+    assert "Event 0: order_created" in tested.stdout
+    report = json.loads((cli_cwd / "runs" / "latest.json").read_text())
+    assert report["scenario"] == "all"
+    assert len(report["results"]) == 5
+    assert report["evaluation"]["passed"] is True
+
+
 def test_cli_demo_writes_both_reports_and_prints_evidence(cli_cwd) -> None:
     demonstrated = runner.invoke(app, ["demo"])
 

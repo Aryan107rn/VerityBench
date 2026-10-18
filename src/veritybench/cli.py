@@ -10,6 +10,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 
@@ -17,12 +18,15 @@ import typer
 
 from veritybench_engine import (
     DefectiveSampleAgent,
+    DeterministicEngine,
+    ExecutionEvent,
     FaultScenario,
     SafeSampleAgent,
     SimulationConfig,
-    SimulationResult,
     simulate,
 )
+
+from .local_worker import LocalWorkerError, run_local_agent
 
 app = typer.Typer(
     name="veritybench",
@@ -30,6 +34,12 @@ app = typer.Typer(
     no_args_is_help=True,
     invoke_without_command=True,
 )
+agents_app = typer.Typer(help="Inspect supported local agent modes.")
+scenarios_app = typer.Typer(help="Inspect deterministic evaluation scenarios.")
+runs_app = typer.Typer(help="List and inspect saved local reports.", invoke_without_command=True)
+app.add_typer(agents_app, name="agents")
+app.add_typer(scenarios_app, name="scenarios")
+app.add_typer(runs_app, name="runs")
 
 CONFIG_FILE = Path("veritybench.toml")
 RUNS_DIR = Path("runs")
@@ -66,6 +76,12 @@ def _scenario(value: str) -> FaultScenario:
         _fail(f"unsupported scenario {value!r}; choose one of: {choices}")
 
 
+def _scenarios(value: str) -> list[FaultScenario]:
+    if value == "all":
+        return list(FaultScenario)
+    return [_scenario(value)]
+
+
 def _agent(value: str) -> SafeSampleAgent | DefectiveSampleAgent:
     if value == "safe":
         return SafeSampleAgent()
@@ -74,10 +90,85 @@ def _agent(value: str) -> SafeSampleAgent | DefectiveSampleAgent:
     _fail("agent must be `safe` or `defective`")
 
 
-def _write_report(result: SimulationResult, output: Path) -> None:
+def _write_report(payload: dict[str, object], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    payload = result.to_dict()
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _report_passed(payload: dict[str, object]) -> bool:
+    evaluation = payload.get("evaluation")
+    return isinstance(evaluation, dict) and evaluation.get("passed") is True
+
+
+def _report_trace_length(payload: dict[str, object]) -> int:
+    trace = payload.get("trace")
+    return len(trace) if isinstance(trace, list) else 0
+
+
+def _findings_count(payload: dict[str, object]) -> int:
+    evaluation = payload.get("evaluation")
+    findings = evaluation.get("findings") if isinstance(evaluation, dict) else None
+    return len(findings) if isinstance(findings, list) else 0
+
+
+def _suite_payload(results: list[dict[str, object]]) -> dict[str, object]:
+    """Combine independent scenario reports without inventing a new verdict rule."""
+
+    if not results:
+        _fail("scenario suite produced no results", 1)
+    first = results[0]
+    metrics: dict[str, int] = {}
+    for result in results:
+        result_metrics = result.get("metrics")
+        if not isinstance(result_metrics, dict):
+            continue
+        for key, value in result_metrics.items():
+            if isinstance(key, str) and isinstance(value, int | float):
+                metrics[key] = metrics.get(key, 0) + int(value)
+    invariants: list[dict[str, object]] = []
+    findings: list[object] = []
+    for result in results:
+        scenario = str(result.get("scenario", "unknown"))
+        evaluation = result.get("evaluation")
+        if not isinstance(evaluation, dict):
+            continue
+        invariant_values = evaluation.get("invariants")
+        if isinstance(invariant_values, list):
+            for invariant in invariant_values:
+                if isinstance(invariant, dict):
+                    invariants.append({**invariant, "name": f"{scenario}: {invariant.get('name', 'invariant')}"})
+        finding_values = evaluation.get("findings")
+        if isinstance(finding_values, list):
+            findings.extend(finding_values)
+    trace: list[dict[str, object]] = []
+    for result in results:
+        result_trace = result.get("trace")
+        if isinstance(result_trace, list):
+            trace.extend(event for event in result_trace if isinstance(event, dict))
+    return {
+        "schema_version": 1,
+        "suite": True,
+        "agent_name": first.get("agent_name"),
+        "scenario": "all",
+        "results": results,
+        "trace": trace,
+        "metrics": metrics,
+        "evaluation": {
+            "passed": all(_report_passed(result) for result in results),
+            "invariants": invariants,
+            "findings": findings,
+        },
+    }
+
+
+def _display_live_event(event: dict[str, object]) -> None:
+    event_type = event.get("event_type", "unknown")
+    index = event.get("index", "?")
+    typer.echo(f"Event {index}: {event_type}")
+
+
+def _display_engine_event(event: ExecutionEvent) -> None:
+    _display_live_event(event.to_dict())
 
 
 def _api_base_url(value: str) -> str:
@@ -130,34 +221,128 @@ def validate() -> None:
 
 @app.command()
 def test(
-    scenario: Annotated[str | None, typer.Option(help="Fault scenario to execute.")] = None,
+    scenario: Annotated[str | None, typer.Option(help="Fault scenario to execute, or all.")] = None,
     agent: Annotated[str | None, typer.Option(help="safe or defective sample agent.")] = None,
+    agent_path: Annotated[
+        Path | None,
+        typer.Option("--agent-path", help="Path to a version-1 local Python agent module."),
+    ] = None,
+    timeout: Annotated[float, typer.Option(help="Local-agent subprocess timeout in seconds.")] = 10.0,
     output: Annotated[Path, typer.Option(help="Where to write the JSON report.")] = RUNS_DIR / "latest.json",
     as_json: Annotated[bool, typer.Option("--json", help="Print the complete JSON report.")] = False,
 ) -> None:
-    """Execute one bounded local evaluation and save its evidence."""
+    """Execute one bounded local evaluation and save its evidence.
+
+    ``--agent-path`` loads a documented Python agent in a separate local
+    subprocess. It is intentionally unavailable to API executions.
+    """
 
     config = _load_config()
     project = _section(config, "project")
-    selected_scenario = _scenario(scenario or str(project.get("scenario", "normal")))
-    selected_agent = _agent(agent or str(project.get("agent", "safe")))
-    result = simulate(
-        selected_scenario,
-        agent=selected_agent,
-        config=SimulationConfig(scenario=selected_scenario),
-    )
-    _write_report(result, output)
+    selected_scenarios = _scenarios(scenario or str(project.get("scenario", "normal")))
+    if agent_path is not None and agent is not None:
+        _fail("--agent and --agent-path are mutually exclusive")
+
+    payloads: list[dict[str, object]] = []
+    for selected_scenario in selected_scenarios:
+        simulation_config = SimulationConfig(scenario=selected_scenario)
+        if agent_path is not None:
+            local_callback = None if as_json else _display_live_event
+            try:
+                payload = run_local_agent(
+                    agent_path,
+                    simulation_config,
+                    timeout_seconds=timeout,
+                    on_event=local_callback,
+                )
+            except LocalWorkerError as exc:
+                exit_code = 124 if exc.code == "agent_timeout" else 2
+                _fail(f"{exc.code}: {exc.message}", exit_code)
+        else:
+            selected_agent = _agent(agent or str(project.get("agent", "safe")))
+            engine_callback: Callable[[ExecutionEvent], None] | None = (
+                None if as_json else _display_engine_event
+            )
+            result = DeterministicEngine(simulation_config).run(selected_agent, on_event=engine_callback)
+            payload = result.to_dict()
+        payloads.append(payload)
+
+    payload = payloads[0] if len(payloads) == 1 else _suite_payload(payloads)
+
+    _write_report(payload, output)
     if as_json:
-        typer.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        status = "PASS" if result.evaluation.passed else "FAIL"
+        status = "PASS" if _report_passed(payload) else "FAIL"
         typer.echo(
-            f"{status} {result.agent_name} / {result.scenario.value} · "
-            f"{len(result.trace)} events · {len(result.evaluation.findings)} findings"
+            f"{status} {payload.get('agent_name')} / {payload.get('scenario')} · "
+            f"{_report_trace_length(payload)} events · "
+            f"{_findings_count(payload)} findings"
         )
         typer.echo(f"Report: {output}")
-    if not result.evaluation.passed:
+    if not _report_passed(payload):
         raise typer.Exit(1)
+
+
+@agents_app.command("list")
+def list_agents(
+    as_json: Annotated[bool, typer.Option("--json", help="Print a JSON agent catalog.")] = False,
+) -> None:
+    """List sample agents and the CLI-local Python adapter."""
+
+    agents = [
+        {
+            "id": "safe",
+            "name": "safe-sample-agent",
+            "kind": "sample",
+            "scope": "cli-and-api",
+            "description": "Reconciles uncertain payments with the original idempotency key.",
+        },
+        {
+            "id": "defective",
+            "name": "defective-sample-agent",
+            "kind": "sample",
+            "scope": "cli-and-api",
+            "description": "Intentionally retries a lost response with a new key.",
+        },
+        {
+            "id": "local-python",
+            "name": "local Python contract agent",
+            "kind": "python-module",
+            "scope": "cli-local-only",
+            "description": "Loads --agent-path in a bounded subprocess; never runs in FastAPI.",
+        },
+    ]
+    if as_json:
+        typer.echo(json.dumps(agents, indent=2, sort_keys=True))
+        return
+    for item in agents:
+        typer.echo(f"{item['id']}: {item['name']} [{item['scope']}]")
+        typer.echo(f"  {item['description']}")
+
+
+@scenarios_app.command("list")
+def list_scenarios(
+    as_json: Annotated[bool, typer.Option("--json", help="Print a JSON scenario catalog.")] = False,
+) -> None:
+    """List the deterministic payment scenarios."""
+
+    descriptions = {
+        "normal": "The payment succeeds normally.",
+        "timeout_after_success": "The charge succeeds but the response is lost.",
+        "malformed_response": "The provider response cannot be read.",
+        "temporary_failure": "The first payment attempt fails temporarily.",
+        "unrecoverable_failure": "Every payment attempt remains unsuccessful.",
+    }
+    scenarios = [
+        {"id": scenario.value, "description": descriptions[scenario.value]}
+        for scenario in FaultScenario
+    ]
+    if as_json:
+        typer.echo(json.dumps(scenarios, indent=2, sort_keys=True))
+        return
+    for item in scenarios:
+        typer.echo(f"{item['id']}: {item['description']}")
 
 
 @app.command()
@@ -179,8 +364,8 @@ def demo() -> None:
         agent=SafeSampleAgent(),
         config=SimulationConfig(scenario=scenario),
     )
-    _write_report(defective, DEMO_DEFECTIVE_REPORT)
-    _write_report(safe, DEMO_SAFE_REPORT)
+    _write_report(defective.to_dict(), DEMO_DEFECTIVE_REPORT)
+    _write_report(safe.to_dict(), DEMO_SAFE_REPORT)
 
     typer.echo("VerityBench demo evidence")
     for label, result, output in (
@@ -218,6 +403,80 @@ def _read_report(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _report_summary(path: Path, payload: dict[str, Any]) -> dict[str, object]:
+    return {
+        "path": str(path),
+        "agent_name": payload.get("agent_name"),
+        "scenario": payload.get("scenario"),
+        "passed": _report_passed(payload),
+        "metrics": payload.get("metrics", {}),
+    }
+
+
+def _report_paths() -> list[Path]:
+    if not RUNS_DIR.exists():
+        return []
+    return sorted(RUNS_DIR.glob("*.json"))
+
+
+def _list_reports(as_json: bool = False) -> None:
+    reports = _report_paths()
+    if as_json:
+        summaries = [_report_summary(path, _read_report(path)) for path in reports]
+        typer.echo(json.dumps(summaries, indent=2, sort_keys=True))
+        return
+    if not reports:
+        typer.echo("No local runs. Execute `veritybench test` first.")
+        return
+    for path in reports:
+        report_payload = _read_report(path)
+        typer.echo(f"{'PASS' if _report_passed(report_payload) else 'FAIL'}\t{path}")
+
+
+@runs_app.callback()
+def runs_group(
+    context: typer.Context,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON when listing runs.")] = False,
+) -> None:
+    """List saved local reports, or use ``runs show PATH`` for one report."""
+
+    if context.invoked_subcommand is None:
+        _list_reports(as_json=as_json)
+
+
+@runs_app.command("list")
+def list_runs(
+    as_json: Annotated[bool, typer.Option("--json", help="Print a JSON run list.")] = False,
+) -> None:
+    """List saved local reports."""
+
+    _list_reports(as_json=as_json)
+
+
+@runs_app.command("show")
+def show_run(
+    path: Annotated[Path, typer.Argument(help="JSON report path.")] = RUNS_DIR / "latest.json",
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead of a summary.")] = False,
+) -> None:
+    """Show one saved local report."""
+
+    payload = _read_report(path)
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    evaluation = payload.get("evaluation", {})
+    metrics = payload.get("metrics", {})
+    passed = _report_passed(payload)
+    typer.echo(f"{'PASS' if passed else 'FAIL'} {payload.get('agent_name')} / {payload.get('scenario')}")
+    typer.echo(f"Metrics: {json.dumps(metrics, sort_keys=True)}")
+    findings = evaluation.get("findings", []) if isinstance(evaluation, dict) else []
+    for finding in findings:
+        if isinstance(finding, dict):
+            typer.echo(f"- {finding.get('code')}: {finding.get('title')}")
+            typer.echo(f"  Evidence: {', '.join(map(str, finding.get('evidence', [])))}")
+            typer.echo(f"  Recommendation: {finding.get('recommendation')}")
+
+
 @app.command()
 def report(
     path: Annotated[Path, typer.Argument(help="JSON report path.")] = RUNS_DIR / "latest.json",
@@ -240,24 +499,6 @@ def report(
             typer.echo(f"- {finding.get('code')}: {finding.get('title')}")
             typer.echo(f"  Evidence: {', '.join(map(str, finding.get('evidence', [])))}")
             typer.echo(f"  Recommendation: {finding.get('recommendation')}")
-
-
-@app.command()
-def runs() -> None:
-    """List saved local reports."""
-
-    if not RUNS_DIR.exists():
-        typer.echo("No local runs. Execute `veritybench test` first.")
-        return
-    reports = sorted(RUNS_DIR.glob("*.json"))
-    if not reports:
-        typer.echo("No local runs. Execute `veritybench test` first.")
-        return
-    for path in reports:
-        payload = _read_report(path)
-        evaluation = payload.get("evaluation", {})
-        passed = isinstance(evaluation, dict) and evaluation.get("passed") is True
-        typer.echo(f"{'PASS' if passed else 'FAIL'}\t{path}")
 
 
 @app.command()

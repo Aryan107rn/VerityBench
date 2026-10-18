@@ -1,6 +1,15 @@
 export type ApiUser = { id: string; email: string; created_at: string }
 export type ApiProject = { id: string; name: string; description: string; created_at: string }
 
+export type ApiAgent = {
+  key: string
+  name: string
+  description: string
+  source: 'repository'
+  runnable: boolean
+  supported_scenarios: string[]
+}
+
 export type SupportedAgent = 'safe' | 'defective'
 export type SupportedScenario =
   | 'normal'
@@ -83,13 +92,25 @@ export type ApiRun = {
   state: string
   agent: SupportedAgent
   scenario: string
+  cancel_requested: boolean
   created_at: string
+  started_at: string | null
   completed_at: string | null
   report: ApiReport | null
   error_message: string | null
 }
 
 export type ApiRunSummary = Omit<ApiRun, 'report' | 'error_message'>
+
+export type ApiRunEvent = {
+  id: string
+  run_id: string
+  sequence: number
+  schema_version: number
+  event_type: string
+  payload: Record<string, unknown>
+  created_at: string
+}
 
 export type HealthResponse = {
   status: string
@@ -104,8 +125,13 @@ export type ApiClient = {
   listProjects: (token: string) => Promise<ApiProject[]>
   createProject: (token: string, name: string, description?: string) => Promise<ApiProject>
   listProjectRuns: (token: string, projectId: string) => Promise<ApiRunSummary[]>
+  listAgents: (token: string, projectId: string) => Promise<ApiAgent[]>
   createRun: (token: string, projectId: string, agent: SupportedAgent, scenario: SupportedScenario) => Promise<ApiRun>
   getApiRun: (token: string, runId: string) => Promise<ApiRun>
+  listRunEvents: (token: string, runId: string, afterSequence?: number, limit?: number) => Promise<ApiRunEvent[]>
+  pollRunEvents: (token: string, runId: string, afterSequence?: number, limit?: number) => Promise<ApiRunEvent[]>
+  streamRunEvents: (token: string, runId: string, afterSequence: number, onEvent: (event: ApiRunEvent) => void, signal?: AbortSignal) => Promise<void>
+  cancelRun: (token: string, runId: string) => Promise<ApiRun>
 }
 
 export function createApiClient(baseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'): ApiClient {
@@ -144,7 +170,56 @@ export function createApiClient(baseUrl = import.meta.env.VITE_API_URL ?? 'http:
     listProjects: (token) => request('/api/v1/projects', undefined, token),
     createProject: (token, name, description = '') => request('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name, description }) }, token),
     listProjectRuns: (token, projectId) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, undefined, token),
+    listAgents: (token, projectId) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/agents`, undefined, token),
     createRun: (token, projectId, agent, scenario) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, { method: 'POST', body: JSON.stringify({ agent, scenario }) }, token),
     getApiRun: (token, runId) => request(`/api/v1/runs/${encodeURIComponent(runId)}`, undefined, token),
+    listRunEvents: (token, runId, afterSequence = -1, limit = 500) => request(`/api/v1/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=${limit}`, undefined, token),
+    pollRunEvents: (token, runId, afterSequence = -1, limit = 500) => request(`/api/v1/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=${limit}`, undefined, token),
+    streamRunEvents: async (token, runId, afterSequence, onEvent, signal) => {
+      const headers = new Headers({ Accept: 'text/event-stream' })
+      headers.set('Authorization', `Bearer ${token}`)
+      const response = await fetch(`${baseUrl.replace(/\/$/, '')}/api/v1/runs/${encodeURIComponent(runId)}/events/stream?after_sequence=${afterSequence}`, { headers, signal })
+      if (!response.ok) {
+        let detail = `request failed (${response.status})`
+        try {
+          const payload = (await response.json()) as { detail?: string }
+          if (payload.detail) detail = payload.detail
+        } catch {
+          // Keep the HTTP status when the stream endpoint did not return JSON.
+        }
+        throw new Error(`VerityBench API ${detail}`)
+      }
+      if (!response.body) throw new Error('VerityBench API stream returned no body')
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      const consume = (chunk: string) => {
+        buffer += chunk
+        const frames = buffer.split(/\r?\n\r?\n/)
+        buffer = frames.pop() ?? ''
+        for (const frame of frames) {
+          const data = frame
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trim())
+            .join('\n')
+          if (!data) continue
+          onEvent(JSON.parse(data) as ApiRunEvent)
+        }
+      }
+
+      try {
+        while (true) {
+          const result = await reader.read()
+          if (result.done) break
+          consume(decoder.decode(result.value, { stream: true }))
+        }
+        consume(decoder.decode())
+      } finally {
+        reader.releaseLock()
+      }
+    },
+    cancelRun: (token, runId) => request(`/api/v1/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }, token),
   }
 }

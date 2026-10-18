@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .agents import Agent, SafeSampleAgent
@@ -9,6 +10,7 @@ from .evaluation import compute_metrics, evaluate_state
 from .models import (
     AgentAction,
     AgentContext,
+    ExecutionEvent,
     FaultScenario,
     Ledger,
     LedgerEntry,
@@ -21,6 +23,10 @@ from .models import (
     TraceEvent,
     TraceEventType,
 )
+
+
+class ExecutionCancelled(Exception):
+    """Raised when a cooperative execution cancellation is requested."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,8 +135,19 @@ class DeterministicEngine:
 
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
+        self._on_event: Callable[[ExecutionEvent], None] | None = None
+        self._should_cancel: Callable[[], bool] | None = None
 
-    def run(self, agent: Agent | None = None) -> SimulationResult:
+    def run(
+        self,
+        agent: Agent | None = None,
+        *,
+        on_event: Callable[[ExecutionEvent], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> SimulationResult:
+        self._on_event = on_event
+        self._should_cancel = should_cancel
+        self._check_cancel()
         selected_agent = agent or SafeSampleAgent()
         gateway = _DeterministicPaymentGateway(self.config)
         order = Order(
@@ -146,6 +163,7 @@ class DeterministicEngine:
         self._emit(trace, TraceEventType.ORDER_CREATED, order)
 
         for _ in range(self.config.max_steps):
+            self._check_cancel()
             context = AgentContext(
                 order=order,
                 scenario=self.config.scenario,
@@ -161,6 +179,7 @@ class DeterministicEngine:
                 rationale=decision.rationale,
                 idempotency_key=decision.idempotency_key,
             )
+            self._check_cancel()
 
             if decision.action is AgentAction.START_PAYMENT:
                 key = decision.idempotency_key or order.idempotency_key
@@ -286,22 +305,28 @@ class DeterministicEngine:
             self._emit(trace, TraceEventType.PAYMENT_FAILED, order, outcome=result.outcome.value)
         return order, result.outcome
 
-    @staticmethod
     def _emit(
+        self,
         trace: list[TraceEvent],
         event_type: TraceEventType,
         order: Order,
         **attributes: str | int | float | bool | None,
     ) -> None:
-        trace.append(
-            TraceEvent(
-                index=len(trace),
-                tick=len(trace),
-                event_type=event_type,
-                order_id=order.order_id,
-                attributes=attributes,
-            )
+        event = ExecutionEvent(
+            index=len(trace),
+            tick=len(trace),
+            event_type=event_type,
+            order_id=order.order_id,
+            attributes=attributes,
         )
+        trace.append(event)
+        if self._on_event is not None:
+            self._on_event(event)
+        self._check_cancel()
+
+    def _check_cancel(self) -> None:
+        if self._should_cancel is not None and self._should_cancel():
+            raise ExecutionCancelled
 
 
 def simulate(
