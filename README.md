@@ -1,11 +1,13 @@
 # VerityBench
-
 **Test agents. Trust the evidence.**
 
 VerityBench is an evidence-first evaluation workspace for AI agents. The MVP
 ships a deterministic order-processing scenario that records tool-like events,
 simulates payment failures, and independently checks the payment ledger before
 declaring a run successful.
+
+It simulates real-world failures, evaluates agent reliability, identifies
+failure points, and provides actionable insights to improve performance.
 
 ## Current scope
 
