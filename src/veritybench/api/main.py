@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -46,6 +47,11 @@ from .dependencies import current_user, owned_project
 logger = logging.getLogger("veritybench.api")
 settings = get_settings()
 auth_limiter = AuthRateLimiter()
+SampleAgentFactory = Callable[[], SafeSampleAgent | DefectiveSampleAgent]
+SAMPLE_AGENT_FACTORIES: dict[str, SampleAgentFactory] = {
+    "safe": SafeSampleAgent,
+    "defective": DefectiveSampleAgent,
+}
 
 app = FastAPI(
     title="VerityBench API",
@@ -168,14 +174,21 @@ def logout(
     db: Session = Depends(get_db),
 ) -> None:
     authorization = request.headers.get("Authorization", "")
-    token = authorization.removeprefix("Bearer ").strip()
-    if token:
+    scheme, _, token = authorization.partition(" ")
+    token = token.strip()
+    if scheme.lower() == "bearer" and token:
         revoke_session(db, token)
 
 
 @app.get("/api/v1/projects", response_model=list[ProjectResponse])
 def list_projects(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[Project]:
-    return list(db.scalars(select(Project).where(Project.owner_id == user.id).order_by(Project.created_at.desc())))
+    return list(
+        db.scalars(
+            select(Project)
+            .where(Project.owner_id == user.id)
+            .order_by(Project.created_at.desc(), Project.id.desc())
+        )
+    )
 
 
 @app.post("/api/v1/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -224,6 +237,9 @@ def create_run(
     db: Session = Depends(get_db),
 ) -> RunResponse:
     owned_project(project_id, user, db)
+    agent_factory = SAMPLE_AGENT_FACTORIES.get(payload.agent)
+    if agent_factory is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unsupported sample agent")
     run = Run(
         id=str(uuid4()),
         project_id=project_id,
@@ -237,7 +253,7 @@ def create_run(
     run.state = RunState.RUNNING
     db.commit()
     try:
-        selected_agent = SafeSampleAgent() if payload.agent == "safe" else DefectiveSampleAgent()
+        selected_agent = agent_factory()
         result = DeterministicEngine(
             SimulationConfig(scenario=payload.scenario, max_steps=settings.veritybench_max_run_steps)
         ).run(selected_agent)
@@ -268,7 +284,7 @@ def list_runs(
         db.scalars(
             select(Run)
             .where(Run.project_id == project_id)
-            .order_by(Run.created_at.desc())
+            .order_by(Run.created_at.desc(), Run.id.desc())
             .limit(limit)
             .offset(offset)
         )

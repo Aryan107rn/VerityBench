@@ -40,9 +40,99 @@ def test_project_run_report_persists_and_uses_independent_engine() -> None:
         assert run["report"]["metrics"]["duplicate_charges"] == 1
         assert run["report"]["evaluation"]["passed"] is False
 
+        summaries_response = client.get(f"/api/v1/projects/{project_id}/runs", headers=headers)
+        assert summaries_response.status_code == 200
+        assert summaries_response.json() == [
+            {
+                "id": run["id"],
+                "project_id": project_id,
+                "state": "failed",
+                "agent": "defective",
+                "scenario": "timeout_after_success",
+                "created_at": run["created_at"],
+                "completed_at": run["completed_at"],
+            }
+        ]
+
         read_response = client.get(f"/api/v1/runs/{run['id']}", headers=headers)
         assert read_response.status_code == 200
         assert read_response.json()["report"]["trace"]
+
+
+def test_authenticated_project_selection_and_safe_run_report_readback() -> None:
+    with TestClient(app) as client:
+        token, _ = register(client, "flow-owner@example.test")
+        headers = auth(token)
+
+        assert client.get("/api/v1/projects", headers=headers).json() == []
+
+        create_project_response = client.post(
+            "/api/v1/projects",
+            headers=headers,
+            json={"name": "Payments", "description": "controlled scenarios"},
+        )
+        assert create_project_response.status_code == 201, create_project_response.text
+        project = create_project_response.json()
+        assert project["created_at"].endswith("Z")
+
+        second_project_response = client.post(
+            "/api/v1/projects",
+            headers=headers,
+            json={"name": "Refunds", "description": "another controlled scenario"},
+        )
+        assert second_project_response.status_code == 201, second_project_response.text
+        second_project = second_project_response.json()
+
+        listed_projects_response = client.get("/api/v1/projects", headers=headers)
+        assert listed_projects_response.status_code == 200
+        assert listed_projects_response.json() == sorted(
+            [project, second_project],
+            key=lambda item: (item["created_at"], item["id"]),
+            reverse=True,
+        )
+
+        selected_project_response = client.get(f"/api/v1/projects/{project['id']}", headers=headers)
+        assert selected_project_response.status_code == 200
+        assert selected_project_response.json() == project
+
+        create_run_response = client.post(
+            f"/api/v1/projects/{project['id']}/runs",
+            headers=headers,
+            json={"agent": "safe", "scenario": "timeout_after_success"},
+        )
+        assert create_run_response.status_code == 201, create_run_response.text
+        run = create_run_response.json()
+        assert run["state"] == "passed"
+        assert run["report"]["agent_name"] == "safe-sample-agent"
+        assert run["report"]["metrics"]["duplicate_charges"] == 0
+
+        second_run_response = client.post(
+            f"/api/v1/projects/{project['id']}/runs",
+            headers=headers,
+            json={"agent": "safe", "scenario": "normal"},
+        )
+        assert second_run_response.status_code == 201, second_run_response.text
+        second_run = second_run_response.json()
+
+        list_runs_response = client.get(f"/api/v1/projects/{project['id']}/runs", headers=headers)
+        assert list_runs_response.status_code == 200
+        summaries = list_runs_response.json()
+        assert [summary["id"] for summary in summaries] == [
+            item["id"]
+            for item in sorted(
+                [run, second_run],
+                key=lambda item: (item["created_at"], item["id"]),
+                reverse=True,
+            )
+        ]
+        assert all("report" not in summary for summary in summaries)
+        assert all(summary["created_at"].endswith("Z") for summary in summaries)
+
+        persisted_response = client.get(f"/api/v1/runs/{run['id']}", headers=headers)
+        assert persisted_response.status_code == 200
+        persisted = persisted_response.json()
+        assert persisted["report"] == run["report"]
+        assert persisted["completed_at"].endswith("Z")
 
 
 def test_cross_user_project_and_run_access_is_not_disclosed() -> None:
@@ -68,7 +158,7 @@ def test_invalid_session_is_rejected_and_logout_revokes_token() -> None:
     with TestClient(app) as client:
         token, _ = register(client, "logout@example.test")
         assert client.get("/api/v1/auth/me", headers=auth("not-a-token")).status_code == 401
-        assert client.post("/api/v1/auth/logout", headers=auth(token)).status_code == 204
+        assert client.post("/api/v1/auth/logout", headers={"Authorization": f"bearer {token}"}).status_code == 204
         assert client.get("/api/v1/auth/me", headers=auth(token)).status_code == 401
 
 

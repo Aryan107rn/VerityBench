@@ -9,12 +9,13 @@ export type Run = {
   modelVersion: string
   dataset: string
   status: RunStatus
-  score: number
-  scoreDelta: number
+  score: number | null
+  scoreDelta: number | null
   completedAt: string
   duration: string
   cases: number
   passedCases: number
+  caseLabel?: string
   tags: string[]
 }
 

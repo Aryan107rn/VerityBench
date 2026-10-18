@@ -15,6 +15,21 @@ python -m pip install -e .
 cd frontend && npm ci
 ```
 
+The connected browser flow is:
+
+1. Open the frontend and choose **Sign in or register**.
+2. Create or select an authenticated project from the project bar.
+3. Open **Agent runs** and choose one of the repository-owned sample agents and
+   a deterministic payment scenario.
+4. Start the run. The browser reads the persisted run back through the
+   protected detail endpoint before showing its report.
+5. Inspect report-derived metrics, evaluator invariants, ledger entries, trace
+   attributes, findings, recommendations, and export the report JSON.
+
+When the API is unavailable or no authenticated project is selected, the UI
+falls back to explicitly labelled offline demo fixtures. Demo values are not
+presented as persisted tenant data.
+
 ## Useful commands
 
 ```bash

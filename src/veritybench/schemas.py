@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from veritybench_engine import FaultScenario
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Return API timestamps with an explicit UTC offset.
+
+    SQLite drops timezone information for ``DateTime(timezone=True)`` columns.
+    Normalizing at the response boundary keeps timestamps from being interpreted
+    as browser-local time while preserving timezone-aware values from databases
+    that retain them.
+    """
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 class ErrorResponse(BaseModel):
@@ -39,12 +53,22 @@ class UserResponse(BaseModel):
     email: str
     created_at: datetime
 
+    @field_validator("created_at", mode="after")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        return _as_utc(value)
+
 
 class SessionResponse(BaseModel):
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_at: datetime
     user: UserResponse
+
+    @field_validator("expires_at", mode="after")
+    @classmethod
+    def normalize_expires_at(cls, value: datetime) -> datetime:
+        return _as_utc(value)
 
 
 class ProjectCreateRequest(BaseModel):
@@ -68,6 +92,11 @@ class ProjectResponse(BaseModel):
     description: str
     created_at: datetime
 
+    @field_validator("created_at", mode="after")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        return _as_utc(value)
+
 
 class RunCreateRequest(BaseModel):
     agent: Literal["safe", "defective"] = "safe"
@@ -82,6 +111,11 @@ class RunSummary(BaseModel):
     scenario: str
     created_at: datetime
     completed_at: datetime | None = None
+
+    @field_validator("created_at", "completed_at", mode="after")
+    @classmethod
+    def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
+        return _as_utc(value) if value is not None else None
 
 
 class RunResponse(RunSummary):
