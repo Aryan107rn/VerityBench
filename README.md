@@ -32,8 +32,11 @@ claims those queued runs and invokes the Docker sandbox. If that worker is not
 running, the run remains queued and never falls back to FastAPI execution. The
 sandbox mounts only the agent file, disables networking, drops capabilities,
 runs as a non-root UID, and applies read-only, CPU, memory, and process limits.
-ZIP uploads, GitHub imports, arbitrary HTTP agents, external URLs, and real
-payment systems remain unsupported.
+The web registry also supports importing one UTF-8 Python entrypoint from a
+public `https://github.com/OWNER/REPO` URL plus an explicit ref/path. The import
+is allowlisted, size-bounded, recorded with provenance, and still executes only
+through the isolated worker. ZIP uploads, arbitrary HTTP agents, external URLs,
+and real payment systems remain unsupported.
 
 ## Quick start
 
@@ -101,8 +104,28 @@ choose **Sign in or register**, create or select a project, and open
 persist report**, then open the run at `/runs/:id` to inspect its report and
 download **Export JSON**.
 
-The five supported scenarios are `normal`, `timeout_after_success`,
-`malformed_response`, `temporary_failure`, and `unrecoverable_failure`.
+The deterministic scenario catalog is shared by the engine, API, CLI, and UI.
+It currently includes `normal`, `timeout_after_success`, `malformed_response`,
+`malformed_tool_response`, `temporary_failure`, `transient_failure`,
+`rate_limited`, `unrecoverable_failure`, `retry_exhaustion`, `tool_exception`,
+`duplicate_operation`, `conflicting_tool_output`, and
+`malicious_tool_output`. Use the protected API catalog or `veritybench scenarios
+list --json` for descriptions, categories, parameters, and execution limits.
+
+### Observability workspace
+
+The dark-first website uses a compact developer-tool layout with a collapsible
+sidebar, summary counters, per-run bar charts, evaluator coverage, and a dense
+experiment-results table. Search with **Ctrl/Cmd+K** across pages and loaded
+runs, or press **/** to focus experiment search. Results support state filters,
+name/score sorting, pagination within loaded history, and side-by-side comparison.
+
+Open a persisted run for the three-pane trace workspace: ordered event history,
+an Overview/Attributes/JSON inspector, and recorded metadata. Trace, Evaluation,
+Ledger, and Findings tabs expose actual returned evidence. Fixture mode remains
+explicitly labelled, and no unrecorded token/cost/latency metrics are fabricated.
+Light mode and mobile layouts are also supported. Browser regression setup is
+documented in [docs/TESTING.md](docs/TESTING.md).
 
 For the exact hackathon pitch, demo sequence, expected evidence, and submission
 checklist, see [HACKATHON.md](HACKATHON.md).
@@ -119,6 +142,7 @@ veritybench test --scenario normal --agent safe
 veritybench test --scenario all --agent safe
 veritybench test --scenario timeout_after_success \
   --agent-path examples/agents/template_agent.py
+veritybench test --scenario rate_limited --param failure_count=2 --seed 7
 veritybench report runs/latest.json      # summarize a saved report
 veritybench agents list                  # show sample and local agent modes
 veritybench scenarios list               # show deterministic scenarios
@@ -126,6 +150,14 @@ veritybench runs list                    # list JSON reports in runs/
 veritybench runs show runs/latest.json   # inspect one saved report
 veritybench export runs/latest.json --output report.json
 ```
+
+Human-readable reports now use the VerityBench double-V logo and a responsive,
+colored terminal layout: evaluation verdict, metric table, independent checks,
+and actionable findings with evidence and recommendations. The report appears
+automatically after `test`; use `report` or `runs show` to reopen it. Suites also
+show a verdict for every scenario. `NO_COLOR=1` disables colors, and redirected
+output contains no ANSI controls. Use `--json` for unchanged machine-readable
+reports rather than terminal formatting.
 
 `veritybench test` returns exit code 1 when the independent evaluation fails;
 that is expected for the defective timeout example. A local worker timeout

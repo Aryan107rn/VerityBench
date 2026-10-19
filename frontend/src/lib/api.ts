@@ -12,6 +12,16 @@ export type ApiAgent = {
   status?: 'enabled' | 'disabled'
 }
 
+export type ApiAgentRegistration = {
+  id: string
+  project_id: string
+  name: string
+  version: string
+  source_kind: 'inline' | 'github'
+  source_url?: string | null
+  source_ref?: string | null
+}
+
 export type SupportedAgent = string
 export type SupportedScenario =
   | 'normal'
@@ -19,6 +29,49 @@ export type SupportedScenario =
   | 'malformed_response'
   | 'temporary_failure'
   | 'unrecoverable_failure'
+  | 'transient_failure'
+  | 'rate_limited'
+  | 'tool_exception'
+  | 'malformed_tool_response'
+  | 'retry_exhaustion'
+  | 'duplicate_operation'
+  | 'conflicting_tool_output'
+  | 'malicious_tool_output'
+
+const supportedScenarioIds: SupportedScenario[] = [
+  'normal', 'timeout_after_success', 'malformed_response', 'malformed_tool_response',
+  'temporary_failure', 'transient_failure', 'rate_limited', 'unrecoverable_failure',
+  'retry_exhaustion', 'tool_exception', 'duplicate_operation', 'conflicting_tool_output',
+  'malicious_tool_output',
+]
+
+export type ApiScenarioParameter = {
+  name: string
+  label: string
+  description: string
+  type: 'integer' | 'number' | 'string' | 'boolean'
+  default?: string | number | boolean | null
+  minimum?: number
+  maximum?: number
+}
+
+export type ApiScenario = {
+  id: SupportedScenario | string
+  name: string
+  category: string
+  description: string
+  expected_outcome: string
+  deterministic: boolean
+  supported_agent_contract: number
+  parameters: ApiScenarioParameter[]
+  execution_limits: Record<string, number>
+}
+
+export type ApiScenarioConfig = {
+  seed: number
+  parameters: Record<string, string | number | boolean | null>
+  execution_limits: Record<string, number>
+}
 
 export type ApiRunState =
   | 'queued'
@@ -71,6 +124,7 @@ export type ApiReport = {
     successful_payments: number
     timeouts: number
     malformed_responses: number
+    malformed_tool_responses: number
     temporary_failures: number
     unrecoverable_failures: number
     reconciliations: number
@@ -78,6 +132,10 @@ export type ApiReport = {
     duplicate_charges: number
     fulfilled_orders: number
     cancelled_orders: number
+    rate_limited: number
+    tool_exceptions: number
+    conflicting_outputs: number
+    malicious_outputs: number
   }
   evaluation: {
     passed: boolean
@@ -94,6 +152,7 @@ export type ApiReport = {
       recommendation: string
     }>
   }
+  scenario_config?: ApiScenarioConfig
 }
 
 export type ApiEvaluation = ApiReport['evaluation']
@@ -110,6 +169,7 @@ export type ApiRun = {
   completed_at: string | null
   report: ApiReport | null
   error_message: string | null
+  scenario_config?: ApiScenarioConfig | null
 }
 
 export type ApiRunSummary = Omit<ApiRun, 'report' | 'error_message'>
@@ -138,9 +198,11 @@ export type ApiClient = {
   createProject: (token: string, name: string, description?: string) => Promise<ApiProject>
   listProjectRuns: (token: string, projectId: string) => Promise<ApiRunSummary[]>
   listAgents: (token: string, projectId: string) => Promise<ApiAgent[]>
+  listScenarios: (token: string) => Promise<ApiScenario[]>
   registerAgent: (token: string, projectId: string, name: string, version: string, source: string) => Promise<ApiAgent>
+  importGithubAgent: (token: string, projectId: string, name: string, version: string, repositoryUrl: string, ref: string, entrypoint: string) => Promise<ApiAgent>
   disableAgent: (token: string, projectId: string, agentId: string) => Promise<void>
-  createRun: (token: string, projectId: string, agent: SupportedAgent, scenario: SupportedScenario) => Promise<ApiRun>
+  createRun: (token: string, projectId: string, agent: SupportedAgent, scenario: SupportedScenario, options?: { seed?: number; parameters?: Record<string, string | number | boolean | null>; max_retries?: number; max_steps?: number }) => Promise<ApiRun>
   getApiRun: (token: string, runId: string) => Promise<ApiRun>
   listRunEvents: (token: string, runId: string, afterSequence?: number, limit?: number) => Promise<ApiRunEvent[]>
   pollRunEvents: (token: string, runId: string, afterSequence?: number, limit?: number) => Promise<ApiRunEvent[]>
@@ -185,6 +247,7 @@ export function createApiClient(baseUrl = import.meta.env.VITE_API_URL ?? 'http:
     createProject: (token, name, description = '') => request('/api/v1/projects', { method: 'POST', body: JSON.stringify({ name, description }) }, token),
     listProjectRuns: (token, projectId) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, undefined, token),
     listAgents: (token, projectId) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/agents`, undefined, token),
+    listScenarios: (token) => request('/api/v1/scenarios', undefined, token),
     registerAgent: async (token, projectId, name, version, source) => {
       const registration = await request<{ id: string; name: string; version: string }>(
         `/api/v1/projects/${encodeURIComponent(projectId)}/agents`,
@@ -199,11 +262,28 @@ export function createApiClient(baseUrl = import.meta.env.VITE_API_URL ?? 'http:
         source: 'remote',
         runnable: true,
         status: 'enabled',
-        supported_scenarios: ['normal', 'timeout_after_success', 'malformed_response', 'temporary_failure', 'unrecoverable_failure'],
+        supported_scenarios: supportedScenarioIds,
+      }
+    },
+    importGithubAgent: async (token, projectId, name, version, repositoryUrl, ref, entrypoint) => {
+      const registration = await request<ApiAgentRegistration>(
+        `/api/v1/projects/${encodeURIComponent(projectId)}/agents/github`,
+        { method: 'POST', body: JSON.stringify({ name, version, repository_url: repositoryUrl, ref, entrypoint }) },
+        token,
+      )
+      return {
+        key: `remote:${registration.id}`,
+        name: registration.name,
+        version: registration.version,
+        description: 'Public GitHub Python agent executed by the isolated worker.',
+        source: 'remote',
+        runnable: true,
+        status: 'enabled',
+        supported_scenarios: supportedScenarioIds,
       }
     },
     disableAgent: (token, projectId, agentId) => request<void>(`/api/v1/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' }, token),
-    createRun: (token, projectId, agent, scenario) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, { method: 'POST', body: JSON.stringify({ agent, scenario }) }, token),
+    createRun: (token, projectId, agent, scenario, options = {}) => request(`/api/v1/projects/${encodeURIComponent(projectId)}/runs`, { method: 'POST', body: JSON.stringify({ agent, scenario, ...options }) }, token),
     getApiRun: (token, runId) => request(`/api/v1/runs/${encodeURIComponent(runId)}`, undefined, token),
     listRunEvents: (token, runId, afterSequence = -1, limit = 500) => request(`/api/v1/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=${limit}`, undefined, token),
     pollRunEvents: (token, runId, afterSequence = -1, limit = 500) => request(`/api/v1/runs/${encodeURIComponent(runId)}/events?after_sequence=${afterSequence}&limit=${limit}`, undefined, token),

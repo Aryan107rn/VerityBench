@@ -1,7 +1,9 @@
 import { createContext, useContext, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { BrowserRouter, useLocation, useNavigate } from 'react-router-dom'
 import { AgentsPage } from './components/AgentsPage'
+import { CommandPalette, type WorkspaceCommand } from './components/CommandPalette'
 import { Icon, type IconName } from './components/Icon'
+import { ObservabilityDashboard } from './components/ObservabilityDashboard'
 import { RunExecutionView } from './components/RunExecutionView'
 import { demoCoverage, demoEvaluators, demoRuns } from './data/demo'
 import {
@@ -12,6 +14,7 @@ import {
   type ApiProject,
   type ApiReport,
   type ApiRun,
+  type ApiScenario,
   type ApiUser,
   type SupportedAgent,
   type SupportedScenario,
@@ -67,12 +70,22 @@ const viewLabels: Record<View, string> = {
   cli: 'CLI guide',
 }
 
-const scenarios: Array<{ value: SupportedScenario; label: string; description: string }> = [
+type ScenarioOption = { value: SupportedScenario; label: string; description: string; category?: string; parameters?: ApiScenario['parameters']; expectedOutcome?: string }
+
+const scenarios: ScenarioOption[] = [
   { value: 'normal', label: 'Normal payment', description: 'Provider returns a successful payment response.' },
   { value: 'timeout_after_success', label: 'Timeout after success', description: 'A charge succeeds but its response is lost.' },
   { value: 'malformed_response', label: 'Malformed response', description: 'The provider returns an unreadable response.' },
   { value: 'temporary_failure', label: 'Temporary failure', description: 'The first payment attempt fails temporarily.' },
   { value: 'unrecoverable_failure', label: 'Unrecoverable failure', description: 'Every payment attempt remains unsuccessful.' },
+  { value: 'transient_failure', label: 'Transient failure', description: 'A configurable number of provider failures precede recovery.' },
+  { value: 'rate_limited', label: 'HTTP 429 rate limit', description: 'Rate-limit responses test bounded backoff and retry behavior.' },
+  { value: 'tool_exception', label: 'Tool exception', description: 'The payment tool raises a controlled exception fixture.' },
+  { value: 'malformed_tool_response', label: 'Malformed tool response', description: 'A tool returns an unparseable response fixture.' },
+  { value: 'retry_exhaustion', label: 'Retry exhaustion', description: 'Transient faults continue until the retry budget is exhausted.' },
+  { value: 'duplicate_operation', label: 'Duplicate operation', description: 'A lost response tests duplicate settlement prevention.' },
+  { value: 'conflicting_tool_output', label: 'Conflicting tool output', description: 'A tool output conflicts with the operation context.' },
+  { value: 'malicious_tool_output', label: 'Malicious tool output', description: 'Instruction-like tool output must be treated as untrusted data.' },
 ]
 
 const localRunAgents: ApiAgent[] = [
@@ -353,6 +366,7 @@ function Workspace() {
   const [projectsLoading, setProjectsLoading] = useState(false)
   const [projectError, setProjectError] = useState('')
   const [apiAgents, setApiAgents] = useState<ApiAgent[]>([])
+  const [apiScenarios, setApiScenarios] = useState<ApiScenario[]>([])
   const [agentsLoading, setAgentsLoading] = useState(false)
   const [agentsError, setAgentsError] = useState('')
   const [agentRegistrationBusy, setAgentRegistrationBusy] = useState(false)
@@ -366,9 +380,14 @@ function Workspace() {
   const [localDatasets, setLocalDatasets] = useState<LocalDataset[]>(() => readStoredDatasets())
   const [enabledEvaluators, setEnabledEvaluators] = useState<string[]>(() => readStoredEvaluators())
   const [localSettings, setLocalSettings] = useState<LocalSettings>(() => readStoredSettings())
+  const [sidebarCompact, setSidebarCompact] = useState(false)
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
 
   const token = session?.token ?? null
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null
+  const scenarioOptions = useMemo<ScenarioOption[]>(() => apiScenarios.length
+    ? apiScenarios.map((scenario) => ({ value: scenario.id as SupportedScenario, label: scenario.name, description: scenario.description, category: scenario.category, parameters: scenario.parameters, expectedOutcome: scenario.expected_outcome }))
+    : scenarios, [apiScenarios])
   const apiMode = apiStatus === 'online' && Boolean(token && selectedProjectId)
   const displayRuns = apiMode ? apiRuns.map(apiRunToView) : demoRuns
   const selectedApiRun = apiRuns.find((run) => run.id === selectedRunId && run.project_id === selectedProjectId) ?? null
@@ -381,6 +400,17 @@ function Workspace() {
     document.documentElement.dataset.theme = theme
     writeStorage(themeStorageKey, theme)
   }, [theme])
+
+  useEffect(() => {
+    const keyboard = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setCommandPaletteOpen((current) => !current)
+      }
+    }
+    window.addEventListener('keydown', keyboard)
+    return () => window.removeEventListener('keydown', keyboard)
+  }, [])
 
   useEffect(() => {
     writeStorage(datasetsStorageKey, localDatasets)
@@ -407,6 +437,7 @@ function Workspace() {
       setSelectedProjectId(null)
       saveStoredProject(null)
       setApiAgents([])
+      setApiScenarios([])
       setApiRuns([])
       return
     }
@@ -425,6 +456,16 @@ function Workspace() {
     }).finally(() => active && setProjectsLoading(false))
     return () => { active = false }
   }, [api, token])
+
+  useEffect(() => {
+    let active = true
+    if (!token || apiStatus !== 'online') {
+      setApiScenarios([])
+      return
+    }
+    api.listScenarios(token).then((catalog) => active && setApiScenarios(catalog)).catch(() => active && setApiScenarios([]))
+    return () => { active = false }
+  }, [api, apiStatus, token])
 
   useEffect(() => {
     let active = true
@@ -524,12 +565,12 @@ function Workspace() {
     navigate('/runs')
   }
 
-  const submitRun = async (agent: SupportedAgent, scenario: SupportedScenario) => {
+  const submitRun = async (agent: SupportedAgent, scenario: SupportedScenario, options?: { seed?: number; parameters?: Record<string, string | number | boolean | null> }) => {
     if (!token || !selectedProjectId) return
     setRunBusy(true)
     setRunComposerError('')
     try {
-      const created = await api.createRun(token, selectedProjectId, agent, scenario)
+      const created = await api.createRun(token, selectedProjectId, agent, scenario, options)
       setApiRuns((current) => [created, ...current.filter((run) => run.id !== created.id)])
       setRunComposerOpen(false)
       navigate(`/runs/${encodeURIComponent(created.id)}`)
@@ -551,6 +592,17 @@ function Workspace() {
     }
   }
 
+  const importGithubAgent = async (name: string, version: string, repositoryUrl: string, ref: string, entrypoint: string) => {
+    if (!token || !selectedProjectId) throw new Error('Sign in and select a project before importing an agent.')
+    setAgentRegistrationBusy(true)
+    try {
+      const imported = await api.importGithubAgent(token, selectedProjectId, name, version, repositoryUrl, ref, entrypoint)
+      setApiAgents((current) => [imported, ...current])
+    } finally {
+      setAgentRegistrationBusy(false)
+    }
+  }
+
   const setView = (nextView: View) => {
     const item = navItems.find((navItem) => navItem.id === nextView)
     navigate(item?.path ?? '/')
@@ -564,8 +616,14 @@ function Workspace() {
     setLocalSettings({ showFixtureHints: true, compactRows: false })
   }
 
+  const commands: WorkspaceCommand[] = [
+    ...navItems.map((item) => ({ id: item.id, label: item.label, detail: 'Navigate to page', icon: item.icon, run: () => setView(item.id) })),
+    { id: 'new-evaluation', label: 'New evaluation', detail: 'Configure and persist an agent run', icon: 'play', run: requestRun },
+    ...displayRuns.map((run) => ({ id: run.id, label: run.name, detail: `${run.id} · ${run.dataset}`, icon: 'activity' as const, run: () => openRun(run.id) })),
+  ]
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCompact ? 'sidebar-is-compact' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-top">
           <button className="brand-lockup" onClick={() => navigate('/')} type="button">
@@ -578,10 +636,11 @@ function Workspace() {
           <span className="workspace-copy"><span className="workspace-label">Workspace</span><strong>{selectedProject?.name ?? 'Local explorer'}</strong></span>
           <Icon name="chevron-down" size={15} />
         </div>
+        <button aria-label="Search workspace" className="sidebar-search" onClick={() => setCommandPaletteOpen(true)} type="button"><Icon name="search" size={15} /><span>Search workspace</span><kbd>⌘ K</kbd></button>
         <nav aria-label="Main navigation" className="main-nav">
-          <span className="nav-section-label">Workspace</span>
+          <span className="nav-section-label">Observability</span>
           {navItems.slice(0, 2).map((item) => <NavItem active={view === item.id || (view === 'run' && item.id === 'dashboard')} count={item.id === 'dashboard' ? displayRuns.length : undefined} item={item} key={item.id} onNavigate={setView} />)}
-          <span className="nav-section-label nav-section-spaced">Configure</span>
+          <span className="nav-section-label nav-section-spaced">Workspace</span>
           {navItems.slice(2, 7).map((item) => <NavItem active={view === item.id} item={item} key={item.id} onNavigate={setView} />)}
         </nav>
         <div className="sidebar-bottom">
@@ -596,9 +655,10 @@ function Workspace() {
 
       <div className="app-main">
         <header className="topbar">
-          <div className="breadcrumbs" aria-label="Breadcrumb"><span>VerityBench</span><span className="breadcrumb-separator">/</span><strong>{viewLabels[view]}</strong></div>
+          <div className="topbar-context"><button aria-label={sidebarCompact ? 'Expand sidebar' : 'Collapse sidebar'} aria-expanded={!sidebarCompact} className="icon-button sidebar-toggle" onClick={() => setSidebarCompact((current) => !current)} type="button"><Icon name="menu" size={17} /></button><div className="breadcrumbs" aria-label="Breadcrumb"><span>{selectedProject?.name ?? 'Local workspace'}</span><span className="breadcrumb-separator">/</span><strong>{viewLabels[view]}</strong></div></div>
           <div className="topbar-actions">
             <SourceBadge apiMode={apiMode} apiStatus={apiStatus} />
+            <button aria-label="Search workspace" className="icon-button topbar-search" onClick={() => setCommandPaletteOpen(true)} type="button"><Icon name="search" size={16} /></button>
             <button aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`} className="theme-toggle" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} type="button"><Icon name={theme === 'light' ? 'moon' : 'sun'} size={16} /><span>{theme === 'light' ? 'Dark' : 'Light'}</span></button>
             <button aria-label={session ? `Sign out ${session.user.email}` : 'Sign in'} className="topbar-avatar profile-button" onClick={session ? signOut : () => setAuthOpen(true)} type="button">{session ? session.user.email.slice(0, 2).toUpperCase() : 'SI'}</button>
           </div>
@@ -609,10 +669,9 @@ function Workspace() {
           <ProjectBar apiStatus={apiStatus} error={projectError} loading={projectsLoading} onCreate={createProject} onOpenAuth={() => setAuthOpen(true)} onSelect={selectProject} projects={projects} selectedProjectId={selectedProjectId} session={session} />
           {noticeVisible && localSettings.showFixtureHints && <div className={`data-notice ${apiMode ? 'data-notice-live' : ''}`}><Icon name={apiMode ? 'shield' : 'layers'} size={16} /><span><strong>{apiMode ? 'Live project data' : apiStatus === 'offline' ? 'API unavailable · offline fallback' : 'Local fixture mode'}</strong>{' · '}{apiMode ? 'Runs, metrics, reports, and evidence are loaded from the selected project.' : 'Read-only fixtures are labeled throughout; no local action writes to the API.'}</span><button aria-label="Dismiss data source notice" className="notice-dismiss" onClick={() => setNoticeVisible(false)} type="button">×</button></div>}
           {runError && apiMode && <div className="inline-error" role="alert">{runError}</div>}
-          {view === 'overview' && <Overview apiData={apiMode} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} runs={displayRuns} stats={stats} trend={trend} />}
-          {view === 'dashboard' && <Dashboard agents={apiMode ? apiAgents : localRunAgents} apiData={apiMode} apiRuns={apiRuns} composerOpen={runComposerOpen} compactRows={localSettings.compactRows} onCancelRun={() => setRunComposerOpen(false)} onOpenRun={openRun} onRun={requestRun} onSubmitRun={submitRun} runBusy={runBusy} runComposerError={runComposerError} runs={displayRuns} stats={stats} trend={trend} />}
+          {(view === 'overview' || view === 'dashboard') && <ObservabilityDashboard apiData={apiMode} apiRuns={apiRuns} compactRows={localSettings.compactRows} composer={view === 'dashboard' && runComposerOpen ? <RunComposer busy={runBusy} error={runComposerError} onCancel={() => setRunComposerOpen(false)} onSubmit={submitRun} scenarioOptions={scenarioOptions} /> : undefined} coverage={coverage} onNavigate={setView} onOpenRun={openRun} onRun={requestRun} overview={view === 'overview'} runs={displayRuns} stats={stats} />}
            {view === 'run' && <RunDetail api={api} apiRun={apiMode ? selectedApiRun : null} loading={apiMode && runsLoading && !selectedApiRun} onBack={() => setView('dashboard')} onRunUpdated={(nextRun) => setApiRuns((current) => [nextRun, ...current.filter((run) => run.id !== nextRun.id)])} run={selectedRun} token={token} />}
-           {view === 'agents' && <AgentsPage agents={apiAgents} apiData={apiMode} error={agentsError} loading={agentsLoading} onBrowseRuns={() => setView('dashboard')} onOpenCli={() => setView('cli')} onRegister={registerAgent} registrationBusy={agentRegistrationBusy} onRetry={() => { if (token && selectedProjectId) { setAgentsLoading(true); api.listAgents(token, selectedProjectId).then(setApiAgents).catch((error: unknown) => setAgentsError(error instanceof Error ? error.message : 'Could not load project agents.')).finally(() => setAgentsLoading(false)) } }} />}
+            {view === 'agents' && <AgentsPage agents={apiAgents} apiData={apiMode} error={agentsError} loading={agentsLoading} onBrowseRuns={() => setView('dashboard')} onOpenCli={() => setView('cli')} onRegister={registerAgent} onImportGithub={importGithubAgent} registrationBusy={agentRegistrationBusy} onRetry={() => { if (token && selectedProjectId) { setAgentsLoading(true); api.listAgents(token, selectedProjectId).then(setApiAgents).catch((error: unknown) => setAgentsError(error instanceof Error ? error.message : 'Could not load project agents.')).finally(() => setAgentsLoading(false)) } }} />}
           {view === 'datasets' && <DatasetsPage datasets={localDatasets} onAdd={(dataset) => setLocalDatasets((current) => [...current, dataset])} onSelect={setView} />}
           {view === 'evaluators' && <EvaluatorsPage enabled={enabledEvaluators} onToggle={(id) => setEnabledEvaluators((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />}
           {view === 'settings' && <SettingsPage apiStatus={apiStatus} enabledEvaluators={enabledEvaluators.length} localSettings={localSettings} onCheck={() => { setApiStatus('checking'); api.getHealth().then(() => setApiStatus('online')).catch(() => setApiStatus('offline')) }} onReset={resetLocalConfig} onSettingsChange={updateLocalSettings} onThemeChange={setTheme} session={session} theme={theme} />}
@@ -621,12 +680,13 @@ function Workspace() {
         </AgentCatalogContext.Provider>
       </div>
       {authOpen && <AuthPanel api={api} onClose={() => setAuthOpen(false)} onSignedIn={setSignedIn} />}
+      {commandPaletteOpen && <CommandPalette commands={commands} onClose={() => setCommandPaletteOpen(false)} />}
     </div>
   )
 }
 
 function NavItem({ active, count, item, onNavigate }: { active: boolean; count?: number; item: typeof navItems[number]; onNavigate: (view: View) => void }) {
-  return <button aria-current={active ? 'page' : undefined} className={`nav-item ${active ? 'is-active' : ''}`} onClick={() => onNavigate(item.id)} type="button"><Icon name={item.icon} size={17} /><span className="nav-label">{item.label}</span>{count !== undefined && <span className="nav-count">{String(count).padStart(2, '0')}</span>}</button>
+  return <button aria-current={active ? 'page' : undefined} aria-label={item.label} className={`nav-item ${active ? 'is-active' : ''}`} onClick={() => onNavigate(item.id)} title={item.label} type="button"><Icon name={item.icon} size={17} /><span className="nav-label">{item.label}</span>{count !== undefined && <span className="nav-count">{String(count).padStart(2, '0')}</span>}</button>
 }
 
 function ProjectBar({ apiStatus, error, loading, onCreate, onOpenAuth, onSelect, projects, selectedProjectId, session }: { apiStatus: ApiStatus; error: string; loading: boolean; onCreate: (name: string, description: string) => Promise<void>; onOpenAuth: () => void; onSelect: (projectId: string) => void; projects: ApiProject[]; selectedProjectId: string | null; session: Session | null }) {
@@ -714,12 +774,14 @@ function Dashboard({ agents, apiData, apiRuns, composerOpen, compactRows, onCanc
   return <><PageIntro eyebrow="Evaluation history" title="Agent runs" description="Replay controlled scenarios and inspect the evidence behind every outcome." action={<button className="button button-primary" onClick={onRun} type="button"><Icon name="play" size={14} /> Run sample agent</button>} />{composerOpen && <RunComposer busy={runBusy} error={runComposerError} onCancel={onCancelRun} onSubmit={onSubmitRun} />}<div className="metric-grid dashboard-metrics"><MetricCard label="Evaluation pass rate" value={stats.passRate} detail={stats.evaluated} icon="gauge" tone="accent" /><MetricCard label="Recorded traces" value={stats.traceCount} detail={apiData ? 'From persisted reports' : 'From fixtures'} icon="activity" tone="violet" /><MetricCard label="Duplicate charges" value={stats.duplicateCharges} detail={apiData ? 'Report metric total' : 'Not in fixture metadata'} icon="warning" tone="amber" /><MetricCard label="Safe retests" value={stats.safeRetests} detail={apiData ? 'Passed safe reports' : 'Fixture runs'} icon="check" tone="green" /></div><div className="dashboard-grid"><TrendPanel apiData={apiData} points={trend} /><AgentComparison apiData={apiData} runs={apiRuns} /></div><section className="panel runs-table-panel"><div className="panel-heading table-heading"><div><span className="section-kicker">{apiData ? 'Authenticated project' : 'Deterministic sample suite'}</span><h2>{apiData ? 'Persisted agent runs' : 'Fixture run history'}</h2></div><span className="muted-label">{filteredRuns.length} of {runs.length}</span></div><div className="table-toolbar"><label className="search-field"><Icon name="search" size={15} /><span className="sr-only">Filter runs</span><input onChange={(event) => setQuery(event.target.value)} placeholder="Filter by run, dataset, or id" value={query} /></label><div className="filter-group" aria-label="Run status filter">{(['all', 'completed', 'needs-review', 'running'] as const).map((value) => <button className={filter === value ? 'filter-active' : ''} key={value} onClick={() => setFilter(value)} type="button">{value === 'all' ? 'All' : value === 'needs-review' ? 'Needs review' : value === 'completed' ? 'Passed' : 'Running'}</button>)}</div></div><div className="runs-table-wrap"><table className="runs-table"><thead><tr><th>Run</th><th>Agent</th><th>Scenario</th><th>Status</th><th>Score</th><th>Completed</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>{filteredRuns.length ? filteredRuns.map((run) => <tr className={compactRows ? 'compact-row' : ''} key={run.id} onClick={() => onOpenRun(run.id)}><td><button className="table-run-name" onClick={(event) => { event.stopPropagation(); onOpenRun(run.id) }} type="button"><span className="table-run-icon"><Icon name="activity" size={14} /></span><span><strong>{run.name}</strong><small>{run.id}</small></span></button></td><td>{run.model}<small>{run.modelVersion}</small></td><td>{run.dataset}</td><td><StatusBadge status={run.status} /></td><td><strong className="table-score">{formatScore(run.score)}</strong><small>{run.score === null ? 'report unavailable' : `${run.passedCases}/${run.cases} ${run.caseLabel ?? 'cases'}`}</small></td><td className="muted-cell">{run.completedAt}</td><td><button aria-label={`Open ${run.name}`} className="icon-button subtle-icon" onClick={(event) => { event.stopPropagation(); onOpenRun(run.id) }} type="button"><Icon name="chevron-right" size={16} /></button></td></tr>) : <tr><td className="table-empty" colSpan={7}><EmptyPanel description={apiData ? 'No persisted runs match this filter.' : 'No local fixtures match this filter.'} /></td></tr>}</tbody></table></div></section></>
 }
 
-function RunComposer({ busy, error, onCancel, onSubmit }: { busy: boolean; error: string; onCancel: () => void; onSubmit: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void> }) {
+function RunComposer({ busy, error, onCancel, onSubmit, scenarioOptions = scenarios }: { busy: boolean; error: string; onCancel: () => void; onSubmit: (agent: SupportedAgent, scenario: SupportedScenario, options?: { seed?: number; parameters?: Record<string, string | number | boolean | null> }) => Promise<void>; scenarioOptions?: ScenarioOption[] }) {
   const agents = useContext(AgentCatalogContext)
   const [agent, setAgent] = useState<SupportedAgent>(agents.find((item) => item.runnable)?.key ?? 'safe')
   const [scenario, setScenario] = useState<SupportedScenario>('normal')
+  const [seed, setSeed] = useState(0)
+  const [parameterValues, setParameterValues] = useState<Record<string, string | number | boolean | null>>({})
   const selectedAgent = agents.find((item) => item.key === agent)
-  const availableScenarios = scenarios.filter((item) => selectedAgent?.supported_scenarios.includes(item.value) ?? true)
+  const availableScenarios = scenarioOptions.filter((item) => selectedAgent?.supported_scenarios.includes(item.value) ?? true)
   const selectedScenario = availableScenarios.find((item) => item.value === scenario) ?? availableScenarios[0]
   useEffect(() => {
     if (!agents.some((item) => item.key === agent && item.runnable)) {
@@ -729,8 +791,12 @@ function RunComposer({ busy, error, onCancel, onSubmit }: { busy: boolean; error
   useEffect(() => {
     if (selectedScenario && scenario !== selectedScenario.value) setScenario(selectedScenario.value)
   }, [scenario, selectedScenario])
-  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void onSubmit(agent, scenario) }
-  return <section className="panel run-composer"><div className="panel-heading"><div><span className="section-kicker">Protected evaluation execution</span><h2>Configure a persisted run</h2></div><button aria-label="Close run controls" className="icon-button subtle-icon" onClick={onCancel} type="button">×</button></div><p className="composer-description">Select an enabled registered agent and a scenario. Remote agents require the separately configured isolated worker; the API never imports their source.</p><form className="composer-form" onSubmit={submit}><label>Agent<select onChange={(event) => setAgent(event.target.value)} value={agent}>{agents.filter((item) => item.runnable).map((item) => <option key={item.key} value={item.key}>{item.name}{item.version ? ` v${item.version}` : ''} · {item.source}</option>)}</select></label><label>Scenario<select onChange={(event) => setScenario(event.target.value as SupportedScenario)} value={scenario}>{availableScenarios.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><span className="field-help">{selectedScenario?.description}</span></label><div className="composer-actions"><button className="button button-primary" disabled={busy || !selectedAgent?.runnable} type="submit"><Icon name="play" size={14} /> {busy ? 'Running…' : 'Run and persist report'}</button><button className="button button-quiet" onClick={onCancel} type="button">Cancel</button></div></form>{error && <p className="auth-error" role="alert">{error}</p>}</section>
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void onSubmit(agent, scenario, { seed, parameters: parameterValues }) }
+  const setParameter = (name: string, value: string, type: NonNullable<ScenarioOption['parameters']>[number]['type']) => {
+    const parsed = type === 'integer' ? Number.parseInt(value, 10) : type === 'number' ? Number(value) : type === 'boolean' ? value === 'true' : value
+    setParameterValues((current) => ({ ...current, [name]: parsed }))
+  }
+  return <section className="panel run-composer"><div className="panel-heading"><div><span className="section-kicker">Protected evaluation execution</span><h2>Configure a persisted run</h2></div><button aria-label="Close run controls" className="icon-button subtle-icon" onClick={onCancel} type="button">×</button></div><p className="composer-description">Select an enabled registered agent and a scenario. Remote agents require the separately configured isolated worker; the API never imports their source.</p><form className="composer-form" onSubmit={submit}><label>Agent<select onChange={(event) => setAgent(event.target.value)} value={agent}>{agents.filter((item) => item.runnable).map((item) => <option key={item.key} value={item.key}>{item.name}{item.version ? ` v${item.version}` : ''} · {item.source}</option>)}</select></label><label>Scenario<select onChange={(event) => { setScenario(event.target.value as SupportedScenario); setParameterValues({}) }} value={scenario}>{availableScenarios.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><span className="field-help">{selectedScenario?.description}{selectedScenario?.category ? ` · ${selectedScenario.category}` : ''}</span></label><label>Seed<input min="0" onChange={(event) => setSeed(Number(event.target.value))} type="number" value={seed} /></label>{selectedScenario?.parameters?.map((parameter) => <label key={parameter.name}>{parameter.label}<input defaultValue={parameter.default == null ? '' : String(parameter.default)} max={parameter.maximum} min={parameter.minimum} onChange={(event) => setParameter(parameter.name, event.target.value, parameter.type)} type={parameter.type === 'string' ? 'text' : 'number'} /><span className="field-help">{parameter.description}</span></label>)}<div className="composer-actions"><button className="button button-primary" disabled={busy || !selectedAgent?.runnable} type="submit"><Icon name="play" size={14} /> {busy ? 'Running…' : 'Run and persist report'}</button><button className="button button-quiet" onClick={onCancel} type="button">Cancel</button></div></form>{error && <p className="auth-error" role="alert">{error}</p>}</section>
 }
 
 function LegacyRunComposer({ busy, error, onCancel, onSubmit }: { busy: boolean; error: string; onCancel: () => void; onSubmit: (agent: SupportedAgent, scenario: SupportedScenario) => Promise<void> }) {

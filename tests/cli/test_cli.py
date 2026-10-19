@@ -53,7 +53,7 @@ def test_cli_runs_all_scenarios_and_streams_sample_events(cli_cwd) -> None:
     assert "Event 0: order_created" in tested.stdout
     report = json.loads((cli_cwd / "runs" / "latest.json").read_text())
     assert report["scenario"] == "all"
-    assert len(report["results"]) == 5
+    assert len(report["results"]) >= 13
     assert report["evaluation"]["passed"] is True
 
 

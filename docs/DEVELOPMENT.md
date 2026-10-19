@@ -113,10 +113,12 @@ veritybench test --agent-path ./my_agent.py --timeout 20 --json \
 ```
 
 `test` executes one bounded deterministic evaluation and writes
-`runs/latest.json` by default. Use `--scenario all` to execute the five
+`runs/latest.json` by default. Use `--scenario all` to execute the complete
 scenarios as a local suite. Use `--scenario`, `--agent`, `--output`, and
 `--json` to select the behavior, sample agent, destination, and output format.
-Use `--agent-path` instead of `--agent` to run a version-1 custom Python agent
+Use `--param NAME=VALUE` (repeatable), `--seed`, `--max-retries`, and
+`--max-steps` to configure a validated deterministic scenario. Use
+`--agent-path` instead of `--agent` to run a version-1 custom Python agent
 in a Docker container. Docker is required, and `VERITYBENCH_AGENT_IMAGE` must
 name a locally available `name@sha256:<64 lowercase hex characters>` image;
 mutable tags and host execution are refused. The default worker timeout is 10
@@ -126,14 +128,36 @@ The supported scenarios are:
 
 - `normal` — the payment succeeds normally.
 - `timeout_after_success` — the charge succeeds but the response is lost.
-- `malformed_response` — the provider response cannot be read.
-- `temporary_failure` — the first payment attempt fails temporarily.
+- `malformed_response`, `malformed_tool_response` — a response/tool payload is not parseable.
+- `temporary_failure`, `transient_failure` — transient provider failures before recovery.
+- `rate_limited` — deterministic HTTP 429 responses before recovery.
 - `unrecoverable_failure` — every payment attempt remains unsuccessful.
+- `retry_exhaustion` — bounded retries end in cancellation without a charge.
+- `tool_exception` — a tool exception is treated as untrusted failure.
+- `duplicate_operation` — duplicate settlement behavior is evaluated independently.
+- `conflicting_tool_output` — conflicting tool identity/amount is rejected.
+- `malicious_tool_output` — instruction-like tool output is treated as untrusted data.
 
 The command exits 0 for a passing evaluation and 1 when the independent
 evaluation finds a defect. The defective timeout run is expected to exit 1.
 Worker timeouts exit 124. Invalid contract modules, invalid paths, and other
 worker refusals exit 2 with a clear diagnostic.
+
+### Terminal report output
+
+By default, `test`, `report`, `runs show`, and `demo` display a styled
+**VerityBench** report with the tagline **Test agents. Trust the evidence.**
+The report includes metrics, checks and their evidence, findings and
+recommendations, and the saved report path. Suites show each scenario's result.
+An unfinished or inconclusive run is labelled `timed_out`, `cancelled`, or
+`inconclusive` rather than being presented as a completed PASS/FAIL evaluation.
+Reports without findings display `No findings.`
+
+Use `--json` with `test`, `report`, or `runs show` for machine-readable output
+matching the saved JSON report, without branding, live events, or ANSI styling.
+Set `NO_COLOR=1` to disable terminal colors. Report layouts automatically adapt
+to the available terminal width; redirected output remains readable without
+ANSI escape controls.
 
 ### Compare both sample agents
 

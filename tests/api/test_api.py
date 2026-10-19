@@ -92,6 +92,93 @@ def test_project_run_report_persists_and_uses_independent_engine() -> None:
         assert read_response.json()["report"]["trace"]
 
 
+def test_authenticated_scenario_catalog_and_configuration_are_persisted() -> None:
+    with TestClient(app) as client:
+        token, _ = register(client, "scenario-owner@example.test")
+        headers = auth(token)
+        catalog_response = client.get("/api/v1/scenarios", headers=headers)
+        assert catalog_response.status_code == 200
+        catalog = catalog_response.json()
+        assert len(catalog) >= 13
+        rate_limit = next(item for item in catalog if item["id"] == "rate_limited")
+        assert rate_limit["category"] == "api/network"
+        assert rate_limit["parameters"][0]["name"] == "failure_count"
+
+        project = client.post("/api/v1/projects", headers=headers, json={"name": "Scenario config"}).json()
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/runs",
+            headers=headers,
+            json={
+                "agent": "safe",
+                "scenario": "rate_limited",
+                "seed": 7,
+                "parameters": {"failure_count": 2},
+                "max_retries": 3,
+                "max_steps": 12,
+            },
+        )
+        assert response.status_code == 201, response.text
+        run = wait_for_terminal(client, response.json()["id"], headers)
+        assert run["state"] == "passed"
+        assert run["scenario_config"] == {
+            "seed": 7,
+            "parameters": {"failure_count": 2},
+            "execution_limits": {"max_retries": 3, "max_steps": 12},
+        }
+        assert run["report"]["scenario_config"] == run["scenario_config"]
+
+
+def test_public_github_import_is_allowlisted_and_stored_as_untrusted_artifact(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def geturl(self):
+            return "https://raw.githubusercontent.com/example/agent/main/agent.py"
+
+        def read(self, _limit):
+            return b"def create_agent():\n    return None\n"
+
+    class FakeOpener:
+        def open(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(api_main, "_github_opener", FakeOpener())
+    with TestClient(app) as client:
+        token, _ = register(client, "github-owner@example.test")
+        headers = auth(token)
+        project = client.post("/api/v1/projects", headers=headers, json={"name": "GitHub"}).json()
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/agents/github",
+            headers=headers,
+            json={
+                "name": "public-agent",
+                "version": "1.0.0",
+                "repository_url": "https://github.com/example/agent",
+                "ref": "main",
+                "entrypoint": "agent.py",
+            },
+        )
+        assert response.status_code == 201, response.text
+        payload = response.json()
+        assert payload["source_kind"] == "github"
+        assert payload["source_url"] == "https://github.com/example/agent"
+        assert payload["source_ref"] == "main"
+
+        rejected = client.post(
+            f"/api/v1/projects/{project['id']}/agents/github",
+            headers=headers,
+            json={
+                "name": "private-network-agent",
+                "version": "1.0.0",
+                "repository_url": "https://127.0.0.1/agent",
+            },
+        )
+        assert rejected.status_code == 422
+
 def test_authenticated_project_selection_and_safe_run_report_readback() -> None:
     with TestClient(app) as client:
         token, _ = register(client, "flow-owner@example.test")
@@ -325,6 +412,12 @@ def test_remote_agent_registration_is_stored_without_api_execution(tmp_path: Pat
             f"/api/v1/projects/{project_id}/agents/{metadata['id']}", headers=headers
         )
         assert disabled.status_code == 204
+        # Drain the disabled registration without executing its source. Leaving
+        # it queued would make later worker tests depend on timestamp/UUID order.
+        assert remote_worker.run_once() is True
+        disabled_run = client.get(f"/api/v1/runs/{queued.json()['id']}", headers=headers).json()
+        assert disabled_run["state"] == "inconclusive"
+        assert disabled_run["error_message"] == "remote agent registration is unavailable"
 
 
 def test_remote_worker_claims_registered_run_and_persists_report(tmp_path: Path, monkeypatch) -> None:
@@ -376,11 +469,7 @@ def test_remote_worker_claims_registered_run_and_persists_report(tmp_path: Path,
         ).json()
         assert queued["state"] == "queued"
 
-        for _ in range(3):
-            current = client.get(f"/api/v1/runs/{queued['id']}", headers=headers).json()
-            if current["state"] != "queued":
-                break
-            assert remote_worker.run_once() is True
+        assert remote_worker.run_once() is True
 
         completed = client.get(f"/api/v1/runs/{queued['id']}", headers=headers).json()
         assert completed["state"] == "passed"

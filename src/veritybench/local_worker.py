@@ -117,6 +117,8 @@ def _simulation_config_to_dict(config: SimulationConfig) -> dict[str, object]:
         "currency": config.currency,
         "max_retries": config.max_retries,
         "max_steps": config.max_steps,
+        "seed": config.seed,
+        "parameters": dict(config.parameters),
     }
 
 
@@ -132,6 +134,8 @@ def _simulation_config_from_dict(payload: object) -> SimulationConfig:
             currency=str(payload["currency"]),
             max_retries=int(payload["max_retries"]),
             max_steps=int(payload["max_steps"]),
+            seed=int(payload.get("seed", 0)),
+            parameters=payload.get("parameters", {}),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise LocalWorkerError("invalid_request", f"invalid worker simulation: {exc}") from exc

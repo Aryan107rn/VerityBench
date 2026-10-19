@@ -16,6 +16,34 @@ diagnostics, bounded subprocess JSON output, live events, and JSON catalog/run
 commands. API tests cover registration, protected project access, cross-user
 denial, and persisted runs.
 
+## Browser UI regressions
+
+The frontend includes a pinned Playwright/Chromium suite. After installing
+the frontend dependencies, install its matching browser once:
+
+```bash
+npm --prefix frontend ci
+cd frontend
+PLAYWRIGHT_BROWSERS_PATH=./node_modules/.cache/ms-playwright npx --no-install playwright install chromium
+npm run test:e2e
+```
+
+The browser cache stays under `frontend/node_modules/`. A clean Linux host
+also needs Chromium's system libraries; Playwright reports missing libraries
+at launch. Browser provisioning is separate from the offline `make test`
+command; after provisioning, the suite uses a local Vite server on port 4175.
+It intercepts API traffic with synthetic fixtures and sessions, never the
+developer's database, browser profile, or credentials.
+
+Coverage includes dark/light theme persistence, navigation, command search,
+experiment search/state filters/sorting/comparison, chart drill-down, mobile
+overflow at 320/390px, and an authenticated mocked run's history/live-stream
+transition, event selection, payload/report tabs, and JSON report download.
+Screenshots of the overview, experiments, and inspector are written beneath
+`frontend/test-results/`; `frontend/playwright-report/index.html` contains the
+test report. These are generated and gitignored, not production assets. Mocked
+API checks do not replace real Docker sandbox integration verification.
+
 ## Security scans
 
 Run these only in the checked-out project and record their actual output in the

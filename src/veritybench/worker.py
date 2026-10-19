@@ -129,7 +129,7 @@ def run_once() -> bool:
             scenario = FaultScenario(run.scenario)
             report = run_local_agent(
                 source_path,
-                SimulationConfig(scenario=scenario, max_steps=settings.veritybench_max_run_steps),
+                _run_simulation_config(run, scenario),
                 timeout_seconds=settings.veritybench_remote_run_timeout_seconds,
                 on_event=lambda event: _persist_worker_event(db, run_id, event),
             )
@@ -146,6 +146,25 @@ def run_once() -> bool:
         return True
     finally:
         db.close()
+
+
+def _run_simulation_config(run: Run, scenario: FaultScenario) -> SimulationConfig:
+    """Rebuild the validated configuration persisted when the run was queued."""
+
+    if not run.scenario_config_json:
+        return SimulationConfig(scenario=scenario, max_steps=settings.veritybench_max_run_steps)
+    try:
+        payload = json.loads(run.scenario_config_json)
+        limits = payload.get("execution_limits", {})
+        return SimulationConfig(
+            scenario=scenario,
+            seed=int(payload.get("seed", 0)),
+            parameters=payload.get("parameters", {}),
+            max_retries=int(limits.get("max_retries", 2)),
+            max_steps=min(int(limits.get("max_steps", settings.veritybench_max_run_steps)), settings.veritybench_max_run_steps),
+        )
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("persisted scenario configuration is invalid") from exc
 
 
 def serve(poll_seconds: float = 1.0) -> None:

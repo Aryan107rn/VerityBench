@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from sqlalchemy import (
@@ -66,6 +67,9 @@ class AgentRegistration(Base):
     source_sha256: Mapped[str] = mapped_column(String(64))
     source_size: Mapped[int] = mapped_column(Integer)
     contract_version: Mapped[int] = mapped_column(Integer)
+    source_kind: Mapped[str] = mapped_column(String(20), default="inline", server_default="inline")
+    source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -85,6 +89,7 @@ class Run(Base):
     state: Mapped[str] = mapped_column(String(20), index=True)
     agent: Mapped[str] = mapped_column(String(128))
     scenario: Mapped[str] = mapped_column(String(60))
+    scenario_config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
@@ -99,6 +104,16 @@ class Run(Base):
         cascade="all, delete-orphan",
         order_by="RunEvent.sequence",
     )
+
+    @property
+    def scenario_config(self) -> dict[str, object] | None:
+        if not self.scenario_config_json:
+            return None
+        try:
+            value = json.loads(self.scenario_config_json)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
 
 
 class RunEvent(Base):

@@ -14,6 +14,7 @@ from veritybench_engine import (
     Order,
     OrderStatus,
     SafeSampleAgent,
+    SimulationConfig,
     TraceEventType,
     evaluate_state,
     simulate,
@@ -319,7 +320,13 @@ def test_runs_are_byte_for_byte_stable_as_serializable_records():
 
 @pytest.mark.parametrize(
     "scenario",
-    [FaultScenario.NORMAL, FaultScenario.TIMEOUT_AFTER_SUCCESS, FaultScenario.TEMPORARY_FAILURE],
+    [
+        FaultScenario.NORMAL,
+        FaultScenario.TIMEOUT_AFTER_SUCCESS,
+        FaultScenario.TEMPORARY_FAILURE,
+        FaultScenario.TRANSIENT_FAILURE,
+        FaultScenario.RATE_LIMITED,
+    ],
 )
 def test_safe_scenarios_end_in_one_charge_or_clean_recovery(scenario):
     result = simulate(scenario)
@@ -327,3 +334,53 @@ def test_safe_scenarios_end_in_one_charge_or_clean_recovery(scenario):
     assert result.evaluation.passed
     assert result.order.status is OrderStatus.FULFILLED
     assert len(result.ledger.charges) == 1
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        FaultScenario.TOOL_EXCEPTION,
+        FaultScenario.MALFORMED_TOOL_RESPONSE,
+        FaultScenario.CONFLICTING_TOOL_OUTPUT,
+        FaultScenario.MALICIOUS_TOOL_OUTPUT,
+    ],
+)
+def test_untrusted_tool_scenarios_cancel_without_a_charge(scenario):
+    result = simulate(scenario)
+
+    assert result.evaluation.passed
+    assert result.order.status is OrderStatus.CANCELLED
+    assert not result.ledger.charges
+    if scenario is FaultScenario.MALFORMED_TOOL_RESPONSE:
+        assert result.metrics.malformed_tool_responses == 1
+
+
+def test_retry_exhaustion_is_bounded_and_records_configured_evidence():
+    result = simulate(
+        FaultScenario.RETRY_EXHAUSTION,
+        config=SimulationConfig(
+            scenario=FaultScenario.RETRY_EXHAUSTION,
+            max_retries=2,
+            parameters={"failure_count": 4},
+        ),
+    )
+
+    assert result.evaluation.passed
+    assert result.order.status is OrderStatus.CANCELLED
+    assert result.metrics.temporary_failures == 3
+    assert result.scenario_parameters["failure_count"] == 4
+    assert result.execution_limits == {"max_retries": 2, "max_steps": 20}
+
+
+def test_scenario_parameters_are_validated_and_runs_are_reproducible():
+    config = SimulationConfig(
+        scenario=FaultScenario.RATE_LIMITED,
+        seed=42,
+        parameters={"failure_count": 2},
+    )
+    first = simulate(config=config).to_dict()
+    second = simulate(config=config).to_dict()
+
+    assert first == second
+    with pytest.raises(ValueError, match="unsupported parameters"):
+        SimulationConfig(scenario=FaultScenario.NORMAL, parameters={"failure_count": 1})

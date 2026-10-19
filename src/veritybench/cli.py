@@ -24,11 +24,13 @@ from veritybench_engine import (
     FaultScenario,
     SafeSampleAgent,
     SimulationConfig,
+    scenario_catalog,
     simulate,
 )
 
 from .local_worker import LocalWorkerError
 from .local_worker import run_sandboxed_agent as run_local_agent
+from .terminal_report import render_report
 
 app = typer.Typer(
     name="veritybench",
@@ -117,6 +119,22 @@ def _scenarios(value: str) -> list[FaultScenario]:
     return [_scenario(value)]
 
 
+def _parameters(values: list[str]) -> dict[str, str | int | float | bool | None]:
+    parameters: dict[str, str | int | float | bool | None] = {}
+    for value in values:
+        name, separator, raw = value.partition("=")
+        if not separator or not name.strip():
+            _fail(f"parameter must use NAME=VALUE syntax: {value!r}")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = raw
+        if not isinstance(parsed, str | int | float | bool) and parsed is not None:
+            _fail(f"parameter value must be a JSON primitive: {value!r}")
+        parameters[name.strip()] = parsed
+    return parameters
+
+
 def _agent(value: str) -> SafeSampleAgent | DefectiveSampleAgent:
     if value == "safe":
         return SafeSampleAgent()
@@ -133,17 +151,6 @@ def _write_report(payload: dict[str, object], output: Path) -> None:
 def _report_passed(payload: dict[str, object]) -> bool:
     evaluation = payload.get("evaluation")
     return isinstance(evaluation, dict) and evaluation.get("passed") is True
-
-
-def _report_trace_length(payload: dict[str, object]) -> int:
-    trace = payload.get("trace")
-    return len(trace) if isinstance(trace, list) else 0
-
-
-def _findings_count(payload: dict[str, object]) -> int:
-    evaluation = payload.get("evaluation")
-    findings = evaluation.get("findings") if isinstance(evaluation, dict) else None
-    return len(findings) if isinstance(findings, list) else 0
 
 
 def _suite_payload(results: list[dict[str, object]]) -> dict[str, object]:
@@ -268,6 +275,10 @@ def test(
     timeout: Annotated[float, typer.Option(help="Local-agent subprocess timeout in seconds.")] = 10.0,
     output: Annotated[Path, typer.Option(help="Where to write the JSON report.")] = RUNS_DIR / "latest.json",
     as_json: Annotated[bool, typer.Option("--json", help="Print the complete JSON report.")] = False,
+    seed: Annotated[int, typer.Option(help="Deterministic scenario seed.")] = 0,
+    parameter: Annotated[list[str] | None, typer.Option("--param", help="Scenario parameter as NAME=VALUE; repeatable.")] = None,
+    max_retries: Annotated[int, typer.Option(help="Maximum agent retries.")] = 2,
+    max_steps: Annotated[int, typer.Option(help="Maximum engine steps.")] = 20,
 ) -> None:
     """Execute one bounded local evaluation and save its evidence.
 
@@ -279,12 +290,22 @@ def test(
     config = _load_config()
     project = _section(config, "project")
     selected_scenarios = _scenarios(scenario or str(project.get("scenario", "normal")))
+    scenario_parameters = _parameters(parameter or [])
     if agent_path is not None and agent is not None:
         _fail("--agent and --agent-path are mutually exclusive")
 
     payloads: list[dict[str, object]] = []
     for selected_scenario in selected_scenarios:
-        simulation_config = SimulationConfig(scenario=selected_scenario)
+        try:
+            simulation_config = SimulationConfig(
+                scenario=selected_scenario,
+                seed=seed,
+                parameters=scenario_parameters,
+                max_retries=max_retries,
+                max_steps=max_steps,
+            )
+        except ValueError as exc:
+            _fail(str(exc))
         if agent_path is not None:
             local_callback = None if as_json else _display_live_event
             try:
@@ -312,13 +333,7 @@ def test(
     if as_json:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        status = "PASS" if _report_passed(payload) else "FAIL"
-        typer.echo(
-            f"{status} {payload.get('agent_name')} / {payload.get('scenario')} · "
-            f"{_report_trace_length(payload)} events · "
-            f"{_findings_count(payload)} findings"
-        )
-        typer.echo(f"Report: {output}")
+        render_report(payload, output)
     if not _report_passed(payload):
         raise typer.Exit(1)
 
@@ -381,22 +396,12 @@ def list_scenarios(
 ) -> None:
     """List the deterministic payment scenarios."""
 
-    descriptions = {
-        "normal": "The payment succeeds normally.",
-        "timeout_after_success": "The charge succeeds but the response is lost.",
-        "malformed_response": "The provider response cannot be read.",
-        "temporary_failure": "The first payment attempt fails temporarily.",
-        "unrecoverable_failure": "Every payment attempt remains unsuccessful.",
-    }
-    scenarios = [
-        {"id": scenario.value, "description": descriptions[scenario.value]}
-        for scenario in FaultScenario
-    ]
+    scenarios = scenario_catalog()
     if as_json:
         typer.echo(json.dumps(scenarios, indent=2, sort_keys=True))
         return
     for item in scenarios:
-        typer.echo(f"{item['id']}: {item['description']}")
+        typer.echo(f"{item['id']}: {item['description']} [{item['category']}]")
 
 
 @app.command()
@@ -445,6 +450,7 @@ def demo() -> None:
             + (recommendation or "preserve the original idempotency key during recovery.")
         )
         typer.echo(f"  Report: {output}")
+        render_report(result.to_dict(), output)
 
 
 def _read_report(path: Path) -> dict[str, Any]:
@@ -518,17 +524,7 @@ def show_run(
     if as_json:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
-    evaluation = payload.get("evaluation", {})
-    metrics = payload.get("metrics", {})
-    passed = _report_passed(payload)
-    typer.echo(f"{'PASS' if passed else 'FAIL'} {payload.get('agent_name')} / {payload.get('scenario')}")
-    typer.echo(f"Metrics: {json.dumps(metrics, sort_keys=True)}")
-    findings = evaluation.get("findings", []) if isinstance(evaluation, dict) else []
-    for finding in findings:
-        if isinstance(finding, dict):
-            typer.echo(f"- {finding.get('code')}: {finding.get('title')}")
-            typer.echo(f"  Evidence: {', '.join(map(str, finding.get('evidence', [])))}")
-            typer.echo(f"  Recommendation: {finding.get('recommendation')}")
+    render_report(payload, path)
 
 
 @app.command()
@@ -542,17 +538,7 @@ def report(
     if as_json:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
-    evaluation = payload.get("evaluation", {})
-    metrics = payload.get("metrics", {})
-    passed = bool(evaluation.get("passed")) if isinstance(evaluation, dict) else False
-    typer.echo(f"{'PASS' if passed else 'FAIL'} {payload.get('agent_name')} / {payload.get('scenario')}")
-    typer.echo(f"Metrics: {json.dumps(metrics, sort_keys=True)}")
-    findings = evaluation.get("findings", []) if isinstance(evaluation, dict) else []
-    for finding in findings:
-        if isinstance(finding, dict):
-            typer.echo(f"- {finding.get('code')}: {finding.get('title')}")
-            typer.echo(f"  Evidence: {', '.join(map(str, finding.get('evidence', [])))}")
-            typer.echo(f"  Recommendation: {finding.get('recommendation')}")
+    render_report(payload, path)
 
 
 @app.command()

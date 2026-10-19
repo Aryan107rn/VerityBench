@@ -15,6 +15,7 @@ from .models import (
     Finding,
     FindingSeverity,
     InvariantResult,
+    JSONPrimitive,
     Ledger,
     LedgerEntry,
     LedgerEntryType,
@@ -28,6 +29,16 @@ from .models import (
     SimulationResult,
     TraceEvent,
     TraceEventType,
+)
+from .scenarios import (
+    SCENARIO_DEFINITIONS,
+    ScenarioCategory,
+    ScenarioDefinition,
+    ScenarioParameter,
+    ScenarioParameterType,
+    scenario_catalog,
+    scenario_definition,
+    validate_scenario_parameters,
 )
 
 __all__ = [
@@ -47,6 +58,7 @@ __all__ = [
     "Finding",
     "FindingSeverity",
     "InvariantResult",
+    "JSONPrimitive",
     "Ledger",
     "LedgerEntry",
     "LedgerEntryType",
@@ -62,7 +74,15 @@ __all__ = [
     "SimulationResult",
     "TraceEvent",
     "TraceEventType",
+    "SCENARIO_DEFINITIONS",
+    "ScenarioCategory",
+    "ScenarioDefinition",
+    "ScenarioParameter",
+    "ScenarioParameterType",
     "compute_metrics",
     "evaluate_state",
     "simulate",
+    "scenario_catalog",
+    "scenario_definition",
+    "validate_scenario_parameters",
 ]

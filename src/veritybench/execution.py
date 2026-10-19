@@ -20,6 +20,7 @@ from veritybench_engine import (
     ExecutionCancelled,
     ExecutionEvent,
     FaultScenario,
+    JSONPrimitive,
     OrderStatus,
     SimulationConfig,
     SimulationResult,
@@ -95,12 +96,15 @@ def submit_run(
     max_steps: int,
     *,
     engine_factory: EngineFactory = DeterministicEngine,
+    seed: int = 0,
+    parameters: Mapping[str, JSONPrimitive] | None = None,
+    max_retries: int = 2,
 ) -> Thread:
     """Start a run in a daemon worker and return without waiting for it."""
 
     worker = Thread(
         target=_execute_run,
-        args=(run_id, scenario, agent_factory, max_steps, engine_factory),
+        args=(run_id, scenario, agent_factory, max_steps, engine_factory, seed, parameters, max_retries),
         name=f"veritybench-run-{run_id}",
         daemon=True,
     )
@@ -114,6 +118,9 @@ def _execute_run(
     agent_factory: AgentFactory,
     max_steps: int,
     engine_factory: EngineFactory,
+    seed: int,
+    parameters: Mapping[str, JSONPrimitive] | None,
+    max_retries: int,
 ) -> None:
     db = SessionLocal()
     try:
@@ -155,7 +162,13 @@ def _execute_run(
             persist_engine_event(db, run_id, event)
 
         result = engine_factory(
-            SimulationConfig(scenario=scenario, max_steps=max_steps)
+            SimulationConfig(
+                scenario=scenario,
+                max_steps=max_steps,
+                max_retries=max_retries,
+                seed=seed,
+                parameters=parameters or {},
+            )
         ).run(
             agent_factory(),
             on_event=on_event,

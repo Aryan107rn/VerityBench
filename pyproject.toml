@@ -15,6 +15,7 @@ dependencies = [
   "fastapi==0.144.0",
   "pydantic==2.12.5",
   "pydantic-settings==2.14.2",
+  "rich==15.0.0",
   "sqlalchemy==2.0.37",
   "typer==0.15.1",
   "uvicorn[standard]==0.34.0",

@@ -101,6 +101,10 @@ class ProjectResponse(BaseModel):
 class RunCreateRequest(BaseModel):
     agent: str = Field(default="safe", min_length=1, max_length=128)
     scenario: FaultScenario = FaultScenario.NORMAL
+    seed: int = Field(default=0, ge=0, le=2_147_483_647)
+    parameters: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    max_retries: int = Field(default=2, ge=0, le=20)
+    max_steps: int = Field(default=20, ge=1, le=1_000)
 
     @field_validator("agent")
     @classmethod
@@ -123,11 +127,14 @@ RunStateValue = Literal[
 
 
 class RunSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     project_id: str
     state: RunStateValue
     agent: str
     scenario: str
+    scenario_config: dict[str, object] | None = None
     cancel_requested: bool = False
     created_at: datetime
     started_at: datetime | None = None
@@ -163,6 +170,7 @@ class RunReport(BaseModel):
     trace: list[dict[str, object]] | None = None
     metrics: dict[str, int] | None = None
     evaluation: dict[str, object] | None = None
+    scenario_config: dict[str, object] | None = None
 
     @model_validator(mode="after")
     def validate_versioned_report(self) -> RunReport:
@@ -180,6 +188,29 @@ class RunReport(BaseModel):
         ):
             raise ValueError("versioned report is missing required evidence fields")
         return self
+
+
+class ScenarioParameterResponse(BaseModel):
+    name: str
+    label: str
+    description: str
+    type: Literal["integer", "number", "string", "boolean"]
+    default: str | int | float | bool | None = None
+    minimum: int | float | None = None
+    maximum: int | float | None = None
+    choices: list[str] = Field(default_factory=list)
+
+
+class ScenarioResponse(BaseModel):
+    id: str
+    name: str = Field(validation_alias="label", serialization_alias="name")
+    category: str
+    description: str
+    expected_outcome: str
+    deterministic: bool
+    supported_agent_contract: int
+    parameters: list[ScenarioParameterResponse]
+    execution_limits: dict[str, int]
 
 
 class RunEventResponse(BaseModel):
@@ -230,6 +261,22 @@ class AgentRegistrationRequest(BaseModel):
         return value
 
 
+class GitHubAgentImportRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=64)
+    contract_version: int = Field(default=1, ge=1, le=1)
+    repository_url: str = Field(min_length=1, max_length=500)
+    ref: str = Field(default="main", min_length=1, max_length=200)
+    entrypoint: str = Field(default="agent.py", min_length=1, max_length=200)
+
+    @field_validator("name", "version", "repository_url", "ref", "entrypoint")
+    @classmethod
+    def clean_github_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value must not be empty")
+        return value
+
 class AgentRegistrationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -240,6 +287,9 @@ class AgentRegistrationResponse(BaseModel):
     source_sha256: str
     source_size: int
     contract_version: int
+    source_kind: Literal["inline", "github"] = "inline"
+    source_url: str | None = None
+    source_ref: str | None = None
     enabled: bool
     created_at: datetime
 

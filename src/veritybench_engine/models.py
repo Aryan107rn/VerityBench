@@ -15,13 +15,21 @@ type JSONPrimitive = str | int | float | bool | None
 
 
 class FaultScenario(str, Enum):
-    """Deterministic payment-provider behavior used by a simulation."""
+    """Stable IDs for code-owned deterministic scenarios."""
 
     NORMAL = "normal"
     TIMEOUT_AFTER_SUCCESS = "timeout_after_success"
     MALFORMED_RESPONSE = "malformed_response"
+    MALFORMED_TOOL_RESPONSE = "malformed_tool_response"
     TEMPORARY_FAILURE = "temporary_failure"
     UNRECOVERABLE_FAILURE = "unrecoverable_failure"
+    TRANSIENT_FAILURE = "transient_failure"
+    RATE_LIMITED = "rate_limited"
+    TOOL_EXCEPTION = "tool_exception"
+    RETRY_EXHAUSTION = "retry_exhaustion"
+    DUPLICATE_OPERATION = "duplicate_operation"
+    CONFLICTING_TOOL_OUTPUT = "conflicting_tool_output"
+    MALICIOUS_TOOL_OUTPUT = "malicious_tool_output"
 
 
 # These aliases make the scenario type convenient for callers that use either
@@ -43,8 +51,13 @@ class PaymentOutcome(str, Enum):
     SUCCESS = "success"
     TIMEOUT = "timeout"
     MALFORMED_RESPONSE = "malformed_response"
+    MALFORMED_TOOL_RESPONSE = "malformed_tool_response"
     TEMPORARY_FAILURE = "temporary_failure"
     UNRECOVERABLE_FAILURE = "unrecoverable_failure"
+    RATE_LIMITED = "rate_limited"
+    TOOL_EXCEPTION = "tool_exception"
+    CONFLICTING_TOOL_OUTPUT = "conflicting_tool_output"
+    MALICIOUS_TOOL_OUTPUT = "malicious_tool_output"
 
 
 class AgentAction(str, Enum):
@@ -96,6 +109,8 @@ class SimulationConfig:
     currency: str = "USD"
     max_retries: int = 2
     max_steps: int = 20
+    seed: int = 0
+    parameters: Mapping[str, JSONPrimitive] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.order_id.strip():
@@ -108,6 +123,16 @@ class SimulationConfig:
             raise ValueError("max_retries must not be negative")
         if self.max_steps < 1:
             raise ValueError("max_steps must be at least one")
+        if not 0 <= self.seed <= 2_147_483_647:
+            raise ValueError("seed must be between 0 and 2147483647")
+        if any(not isinstance(key, str) or not key.strip() for key in self.parameters):
+            raise ValueError("scenario parameter names must be non-empty strings")
+        if any(isinstance(value, dict | list | tuple | set) for value in self.parameters.values()):
+            raise ValueError("scenario parameters must be JSON primitive values")
+        from .scenarios import validate_scenario_parameters
+
+        validated_parameters = validate_scenario_parameters(self.scenario, dict(self.parameters))
+        object.__setattr__(self, "parameters", MappingProxyType(validated_parameters))
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +275,7 @@ class Metrics:
     successful_payments: int = 0
     timeouts: int = 0
     malformed_responses: int = 0
+    malformed_tool_responses: int = 0
     temporary_failures: int = 0
     unrecoverable_failures: int = 0
     reconciliations: int = 0
@@ -257,6 +283,10 @@ class Metrics:
     duplicate_charges: int = 0
     fulfilled_orders: int = 0
     cancelled_orders: int = 0
+    rate_limited: int = 0
+    tool_exceptions: int = 0
+    conflicting_outputs: int = 0
+    malicious_outputs: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -265,6 +295,7 @@ class Metrics:
             "successful_payments": self.successful_payments,
             "timeouts": self.timeouts,
             "malformed_responses": self.malformed_responses,
+            "malformed_tool_responses": self.malformed_tool_responses,
             "temporary_failures": self.temporary_failures,
             "unrecoverable_failures": self.unrecoverable_failures,
             "reconciliations": self.reconciliations,
@@ -272,6 +303,10 @@ class Metrics:
             "duplicate_charges": self.duplicate_charges,
             "fulfilled_orders": self.fulfilled_orders,
             "cancelled_orders": self.cancelled_orders,
+            "rate_limited": self.rate_limited,
+            "tool_exceptions": self.tool_exceptions,
+            "conflicting_outputs": self.conflicting_outputs,
+            "malicious_outputs": self.malicious_outputs,
         }
 
 
@@ -336,6 +371,9 @@ class SimulationResult:
     trace: tuple[ExecutionEvent, ...]
     metrics: Metrics
     evaluation: EvaluationReport
+    scenario_seed: int = 0
+    scenario_parameters: Mapping[str, JSONPrimitive] = field(default_factory=dict)
+    execution_limits: Mapping[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -355,4 +393,9 @@ class SimulationResult:
             "trace": [event.to_dict() for event in self.trace],
             "metrics": self.metrics.to_dict(),
             "evaluation": self.evaluation.to_dict(),
+            "scenario_config": {
+                "seed": self.scenario_seed,
+                "parameters": dict(self.scenario_parameters),
+                "execution_limits": dict(self.execution_limits),
+            },
         }

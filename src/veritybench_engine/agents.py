@@ -49,13 +49,13 @@ class SafeSampleAgent:
 
         if order.status is OrderStatus.PAYMENT_FAILED:
             if (
-                context.last_outcome is PaymentOutcome.TEMPORARY_FAILURE
+                context.last_outcome in {PaymentOutcome.TEMPORARY_FAILURE, PaymentOutcome.RATE_LIMITED}
                 and order.attempts <= context.max_retries
             ):
                 return AgentDecision(
                     action=AgentAction.RETRY_PAYMENT,
                     idempotency_key=order.idempotency_key,
-                    rationale="retry a temporary failure with the same idempotency key",
+                    rationale="retry a transient or rate-limited failure with the same idempotency key",
                 )
             return AgentDecision(
                 action=AgentAction.CANCEL_ORDER,
@@ -103,13 +103,13 @@ class DefectiveSampleAgent:
             return AgentDecision(action=AgentAction.STOP, rationale="stop on an unexpected pending state")
 
         if order.status is OrderStatus.PAYMENT_FAILED:
-            if context.last_outcome is PaymentOutcome.MALFORMED_RESPONSE:
+            if context.last_outcome in {PaymentOutcome.MALFORMED_RESPONSE, PaymentOutcome.MALFORMED_TOOL_RESPONSE}:
                 return AgentDecision(
                     action=AgentAction.FULFILL_ORDER,
                     rationale="incorrectly trust a malformed payment response",
                 )
             if (
-                context.last_outcome is PaymentOutcome.TEMPORARY_FAILURE
+                context.last_outcome in {PaymentOutcome.TEMPORARY_FAILURE, PaymentOutcome.RATE_LIMITED}
                 and order.attempts <= context.max_retries
             ):
                 return AgentDecision(
