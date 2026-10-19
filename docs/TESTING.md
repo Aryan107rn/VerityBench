@@ -8,6 +8,15 @@ python -m pytest tests/engine tests/api tests/cli
 python -m pytest tests/cli -q
 ```
 
+The installable console entrypoint can be smoke-tested from a local package
+environment with:
+
+```bash
+python -m pip install -e .
+veritybench --version
+veritybench --help
+```
+
 The deterministic engine tests cover the safe timeout recovery, defective
 duplicate charge, malformed response, temporary retry, unrecoverable failure,
 independent evaluation, and repeatability requirements. CLI tests cover sample

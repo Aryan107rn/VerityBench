@@ -9,6 +9,17 @@ from veritybench.cli import app
 runner = CliRunner()
 
 
+def test_installed_cli_entrypoint_help_and_version_are_available() -> None:
+    version = runner.invoke(app, ["--version"])
+    assert version.exit_code == 0
+    assert version.stdout.strip() == "veritybench 0.1.0"
+
+    help_output = runner.invoke(app, ["--help"])
+    assert help_output.exit_code == 0
+    assert "evidence-first" in help_output.stdout
+    assert "test" in help_output.stdout
+
+
 def test_cli_runs_safe_recovery_and_reads_report(cli_cwd) -> None:
     initialized = runner.invoke(app, ["init"])
     assert initialized.exit_code == 0, initialized.stdout

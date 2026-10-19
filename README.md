@@ -130,19 +130,68 @@ documented in [docs/TESTING.md](docs/TESTING.md).
 For the exact hackathon pitch, demo sequence, expected evidence, and submission
 checklist, see [HACKATHON.md](HACKATHON.md).
 
-## CLI guide
+## Install the CLI and test locally
 
-The CLI operates locally and does not require login for local evaluation:
+The `veritybench` command is a real installable Python package entrypoint. A
+developer can keep an agent private by running `veritybench test` locally; this
+workflow does not require login, contact the VerityBench API, or upload agent
+source code. Reports are written to the local `runs/` directory.
+
+From a clean checkout:
 
 ```bash
-veritybench init                         # create veritybench.toml and runs/
-veritybench validate                     # check the local configuration
-veritybench agent init ./my-agent.py      # create a compatible starter
-veritybench test --scenario normal --agent safe
-veritybench test --scenario all --agent safe
-veritybench test --scenario timeout_after_success \
-  --agent-path examples/agents/template_agent.py
-veritybench test --scenario rate_limited --param failure_count=2 --seed 7
+git clone https://github.com/Aryan107rn/VerityBench.git
+cd VerityBench
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.lock
+python -m pip install .
+veritybench --version
+```
+
+Initialize a private local evaluation project and create a compatible agent:
+
+```bash
+mkdir private-agent-check && cd private-agent-check
+veritybench init
+veritybench agent init ./my-agent.py
+veritybench validate
+veritybench scenarios list
+```
+
+Run the local agent and save evidence without sending its source anywhere:
+
+```bash
+veritybench test \
+  --agent-path ./my-agent.py \
+  --scenario timeout_after_success \
+  --output runs/my-agent-timeout.json
+veritybench report runs/my-agent-timeout.json
+```
+
+Custom agents require Docker and a digest-pinned
+`VERITYBENCH_AGENT_IMAGE`. The local sandbox disables networking, uses a
+read-only filesystem, runs as non-root, and applies resource limits. For a
+quick engine-only smoke test that does not need Docker, use the repository-owned
+sample agent:
+
+```bash
+veritybench test --agent safe --scenario all --json --output runs/safe-suite.json
+```
+
+Use `--json` for CI/CD, and rely on the process exit code: `0` means the
+independent evaluation passed, `1` means it found a defect, `2` means invalid
+input or a worker refusal, and `124` means the bounded worker timed out.
+`veritybench sync` and the web/API registration/import flows are separate
+remote workflows; do not use them when source privacy is required.
+
+### HTTP API / Advanced Usage
+
+The commands below are for inspecting local reports; the authenticated HTTP/API
+workflow is documented separately and is not required for private local testing:
+
+```bash
 veritybench report runs/latest.json      # summarize a saved report
 veritybench agents list                  # show sample and local agent modes
 veritybench scenarios list               # show deterministic scenarios

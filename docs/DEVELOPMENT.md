@@ -71,16 +71,28 @@ When the API is unavailable, or when no authenticated project is selected, the
 UI falls back to explicitly labelled offline demo fixtures. Demo values are
 read-only and are not presented as persisted tenant data.
 
-## CLI guide
+## Install and use the CLI locally
 
 ```bash
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.lock
+python -m pip install .
 veritybench --help
+veritybench --version
 ```
 
-All local CLI commands use the current directory. Run `veritybench init` before
-`validate` or `test`; it creates the default `runs/` directory as part of the
-local workflow. `demo`, `report`, `runs`, and `export` operate on report paths
-and do not require a configuration file.
+The `[project.scripts]` entry in `pyproject.toml` installs the real
+`veritybench` executable. All local CLI commands use the current directory.
+Run `veritybench init` before `validate` or `test`; it creates the default
+`runs/` directory as part of the local workflow. `demo`, `report`, `runs`, and
+`export` operate on report paths and do not require a configuration file.
+
+`veritybench test` is the privacy-preserving path: it does not contact the API,
+does not require login, and does not upload agent source. `sync`, API agent
+registration, and GitHub import are separate remote workflows and must not be
+used when source must remain local.
 
 ### Initialize and validate
 
@@ -108,6 +120,9 @@ veritybench test --scenario timeout_after_success --agent defective \
   --output runs/defective-timeout.json
 veritybench test --scenario timeout_after_success \
   --agent-path examples/agents/template_agent.py
+veritybench test --scenario timeout_after_success \
+  --agent-path ./my-agent.py \
+  --output runs/my-agent-timeout.json
 veritybench test --agent-path ./my_agent.py --timeout 20 --json \
   --output runs/my-agent.json
 ```
@@ -143,7 +158,7 @@ evaluation finds a defect. The defective timeout run is expected to exit 1.
 Worker timeouts exit 124. Invalid contract modules, invalid paths, and other
 worker refusals exit 2 with a clear diagnostic.
 
-### Terminal report output
+### Terminal report output and CI/CD
 
 By default, `test`, `report`, `runs show`, and `demo` display a styled
 **VerityBench** report with the tagline **Test agents. Trust the evidence.**
@@ -158,6 +173,18 @@ matching the saved JSON report, without branding, live events, or ANSI styling.
 Set `NO_COLOR=1` to disable terminal colors. Report layouts automatically adapt
 to the available terminal width; redirected output remains readable without
 ANSI escape controls.
+
+For CI/CD, save the machine-readable report and preserve the process exit code:
+
+```bash
+veritybench test \
+  --agent-path ./my-agent.py \
+  --scenario all \
+  --json \
+  --output runs/ci-report.json
+```
+
+The local command writes only to the checkout and its configured report path.
 
 ### Compare both sample agents
 
@@ -189,6 +216,12 @@ prints the report instead of the summary. `runs` remains a shorthand for
 `runs list`, while `runs list --json` prints a JSON array of report summaries.
 `export [PATH] --output PATH` reads a report and copies it to a named JSON path;
 the defaults are `runs/latest.json` and `report.json`.
+
+## HTTP API / Advanced Usage
+
+The API-backed commands are optional. Use them only when a team has deliberately
+chosen persisted remote runs, project authentication, or the isolated remote
+worker. They are not part of the private local workflow.
 
 ### Run through the authenticated API from the CLI
 

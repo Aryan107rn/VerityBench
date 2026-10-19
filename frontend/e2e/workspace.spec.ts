@@ -154,6 +154,17 @@ test('charts open their source runs and sidebar can be compacted', async ({ page
   await expect(page).toHaveURL(/\/runs\/run-042$/)
 })
 
+test('CLI guide leads with install and private local testing before advanced HTTP usage', async ({ page }) => {
+  await page.goto('/cli')
+  await expect(page.getByRole('heading', { level: 1, name: 'CLI guide' })).toBeVisible()
+  await expect(page.getByText('Private local mode.', { exact: false })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 2, name: 'Install the CLI' })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 2, name: 'Test locally' })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 2, name: 'HTTP API / Advanced Usage' })).toBeVisible()
+  await expect(page.locator('code').filter({ hasText: 'python -m pip install .' }).first()).toBeVisible()
+  await expect(page.getByText('veritybench test', { exact: false }).first()).toBeVisible()
+})
+
 test('captures the reference-inspired overview and experiments for visual review', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 1040 })
   await page.goto('/')

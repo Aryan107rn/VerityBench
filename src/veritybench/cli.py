@@ -28,6 +28,7 @@ from veritybench_engine import (
     simulate,
 )
 
+from . import __version__
 from .local_worker import LocalWorkerError
 from .local_worker import run_sandboxed_agent as run_local_agent
 from .terminal_report import render_report
@@ -225,7 +226,7 @@ def root(
     version: Annotated[bool, typer.Option("--version", help="Show the CLI version and exit.")] = False,
 ) -> None:
     if version:
-        typer.echo("veritybench 0.1.0")
+        typer.echo(f"veritybench {__version__}")
         raise typer.Exit()
 
 
@@ -282,9 +283,10 @@ def test(
 ) -> None:
     """Execute one bounded local evaluation and save its evidence.
 
-    ``--agent-path`` runs a documented Python agent in a hardened Docker
-    container. Docker is required; it is intentionally unavailable to API
-    executions.
+    This command is local-first: it does not contact the VerityBench API,
+    upload agent source, or require login. ``--agent-path`` runs a documented
+    Python agent in a hardened Docker container. Docker is required for custom
+    agents; it is intentionally unavailable to API executions.
     """
 
     config = _load_config()
