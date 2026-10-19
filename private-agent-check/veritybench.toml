@@ -1,0 +1,9 @@
+# VerityBench local configuration
+[project]
+name = "sample-order-agent"
+agent = "safe"
+scenario = "normal"
+
+[api]
+base_url = "http://localhost:8000"
+project_id = ""
