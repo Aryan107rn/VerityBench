@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: api
     environment:
       DATABASE_URL: sqlite:////data/veritybench.db
       VERITYBENCH_CORS_ORIGINS: http://localhost:5173
@@ -10,6 +11,33 @@ services:
       - "8000:8000"
     volumes:
       - veritybench-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  worker:
+    profiles: ["remote"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    environment:
+      DATABASE_URL: sqlite:////data/veritybench.db
+      VERITYBENCH_AGENT_ARTIFACT_DIR: /data/agent-artifacts
+      VERITYBENCH_AGENT_IMAGE: ${VERITYBENCH_AGENT_IMAGE:-}
+    volumes:
+      - veritybench-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    depends_on:
+      api:
+        condition: service_healthy
     read_only: true
     tmpfs:
       - /tmp

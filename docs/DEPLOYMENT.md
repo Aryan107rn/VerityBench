@@ -3,11 +3,28 @@
 ## Local container
 
 ```bash
+docker compose up --build
 ```
 
 The API listens on port 8000 and the frontend on port 5173. The compose file
 uses a named SQLite volume for local persistence and does not publish a
 database service.
+
+The remote worker is opt-in because it needs access to the host Docker daemon.
+Build or publish a digest-pinned agent image first, then start the worker with
+the Docker socket mounted only into that service:
+
+```bash
+export VERITYBENCH_AGENT_IMAGE='registry.example/veritybench-agent@sha256:<64-lowercase-hex-digest>'
+export DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+docker compose --profile remote up --build
+```
+
+The API container never receives the Docker socket. The worker and API share
+the `veritybench-data` volume so the worker can read the registered source
+artifacts and update the same database. If the image or Docker daemon is not
+available, remote runs remain queued or become inconclusive; no host-execution
+fallback is enabled.
 
 ## Production-style deployment
 
@@ -47,3 +64,5 @@ production use.
 - [ ] Confirm no sample/demo data is presented as tenant data.
 - [ ] Configure backups, retention, alerting, and log redaction.
 - [ ] Keep arbitrary code execution disabled unless the sandbox review is complete.
+- [ ] For remote agents, pin the image by digest and mount the Docker socket
+      only into the isolated worker service.

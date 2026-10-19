@@ -81,6 +81,12 @@ python -m veritybench.worker
 The worker is intentionally not started by FastAPI and the API container must
 not receive the Docker socket.
 
+The local compose deployment also provides the worker as an opt-in `remote`
+profile. Set `VERITYBENCH_AGENT_IMAGE` to a locally available digest-pinned
+image and `DOCKER_GID` to the Docker socket's group before running
+`docker compose --profile remote up --build`; see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
 The initial migration safely baselines an existing complete local SQLite schema;
 it does not delete data from databases created by earlier builds.
 

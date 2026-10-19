@@ -1,4 +1,4 @@
-FROM python:3.12.8-slim AS runtime
+FROM python:3.12.8-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,6 +18,21 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir --no-deps -e . \
     && mkdir -p /data \
     && chown -R veritybench:veritybench /app /data
+
+FROM base AS worker
+
+# The worker is the only application container that talks to the Docker
+# daemon. The API image deliberately does not contain the Docker client.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y docker.io \
+    && rm -rf /var/lib/apt/lists/*
+
+USER veritybench
+ENV DATABASE_URL=sqlite:////data/veritybench.db
+
+CMD ["python", "-m", "veritybench.worker"]
+
+FROM base AS api
 
 USER veritybench
 ENV DATABASE_URL=sqlite:////data/veritybench.db

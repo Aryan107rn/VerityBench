@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import veritybench.worker as remote_worker
 from veritybench.api import main as api_main
 from veritybench.api.main import app
 from veritybench.models import Run
@@ -324,6 +325,106 @@ def test_remote_agent_registration_is_stored_without_api_execution(tmp_path: Pat
             f"/api/v1/projects/{project_id}/agents/{metadata['id']}", headers=headers
         )
         assert disabled.status_code == 204
+
+
+def test_remote_worker_claims_registered_run_and_persists_report(tmp_path: Path, monkeypatch) -> None:
+    api_settings = api_main.settings.model_copy(
+        update={"veritybench_agent_artifact_dir": str(tmp_path)}
+    )
+    monkeypatch.setattr(api_main, "settings", api_settings)
+    monkeypatch.setattr(remote_worker, "settings", api_settings)
+    source = "AGENT_CONTRACT_VERSION = 1\n\ndef create_agent():\n    return None\n"
+
+    def fake_run_local_agent(
+        source_path: Path,
+        config,
+        *,
+        timeout_seconds: float,
+        on_event,
+    ) -> dict[str, object]:
+        assert source_path.read_text() == source
+        assert config.scenario.value == "normal"
+        assert timeout_seconds == api_settings.veritybench_remote_run_timeout_seconds
+        on_event({"event_type": "agent_decision", "schema_version": 1, "payload": {"step": 0}})
+        return {
+            "report_version": 1,
+            "agent_name": "registered-agent",
+            "scenario": "normal",
+            "order": {},
+            "ledger": {},
+            "trace": [],
+            "metrics": {},
+            "evaluation": {"passed": True},
+        }
+
+    monkeypatch.setattr(remote_worker, "run_local_agent", fake_run_local_agent)
+    with TestClient(app) as client:
+        token, _ = register(client, "remote-worker@example.test")
+        headers = auth(token)
+        project_id = client.post(
+            "/api/v1/projects", headers=headers, json={"name": "remote-worker"}
+        ).json()["id"]
+        registration = client.post(
+            f"/api/v1/projects/{project_id}/agents",
+            headers=headers,
+            json={"name": "registered-agent", "version": "1.0.0", "source": source},
+        ).json()
+        queued = client.post(
+            f"/api/v1/projects/{project_id}/runs",
+            headers=headers,
+            json={"agent": f"remote:{registration['id']}", "scenario": "normal"},
+        ).json()
+        assert queued["state"] == "queued"
+
+        for _ in range(3):
+            current = client.get(f"/api/v1/runs/{queued['id']}", headers=headers).json()
+            if current["state"] != "queued":
+                break
+            assert remote_worker.run_once() is True
+
+        completed = client.get(f"/api/v1/runs/{queued['id']}", headers=headers).json()
+        assert completed["state"] == "passed"
+        assert completed["report"]["run_state"] == "passed"
+        events = client.get(f"/api/v1/runs/{queued['id']}/events", headers=headers).json()
+        assert [event["event_type"] for event in events] == [
+            "run_queued",
+            "run_started",
+            "agent_decision",
+            "run_completed",
+        ]
+
+
+def test_remote_worker_rejects_changed_agent_artifact(tmp_path: Path, monkeypatch) -> None:
+    api_settings = api_main.settings.model_copy(
+        update={"veritybench_agent_artifact_dir": str(tmp_path)}
+    )
+    monkeypatch.setattr(api_main, "settings", api_settings)
+    monkeypatch.setattr(remote_worker, "settings", api_settings)
+    source = "AGENT_CONTRACT_VERSION = 1\n"
+    with TestClient(app) as client:
+        token, _ = register(client, "remote-digest@example.test")
+        headers = auth(token)
+        project_id = client.post(
+            "/api/v1/projects", headers=headers, json={"name": "remote-digest"}
+        ).json()["id"]
+        registration = client.post(
+            f"/api/v1/projects/{project_id}/agents",
+            headers=headers,
+            json={"name": "digest-agent", "version": "1.0.0", "source": source},
+        ).json()
+        artifact = tmp_path / f"{registration['id']}.py"
+        artifact.write_text(source + "# changed\n")
+        queued = client.post(
+            f"/api/v1/projects/{project_id}/runs",
+            headers=headers,
+            json={"agent": f"remote:{registration['id']}", "scenario": "normal"},
+        ).json()
+
+        assert remote_worker.run_once() is True
+
+        completed = client.get(f"/api/v1/runs/{queued['id']}", headers=headers).json()
+        assert completed["state"] == "inconclusive"
+        assert completed["error_message"] == "remote agent artifact digest mismatch"
 
 
 def test_cancellation_is_persisted_and_transitions_a_running_run(monkeypatch) -> None:
