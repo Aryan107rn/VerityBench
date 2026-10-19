@@ -940,7 +940,7 @@ function SettingsPage({ apiStatus, enabledEvaluators, localSettings, onCheck, on
   return <><PageIntro eyebrow="Workspace preferences" title="Settings" description="Tune the local shell and inspect the current API connection without implying server-side configuration." /><div className="settings-grid"><section className="panel settings-section"><PanelTitle eyebrow="Appearance" title="Theme" meta="Saved locally" /><p className="settings-description">Choose a durable light or dark presentation for this browser.</p><div className="theme-options"><button className={`theme-option ${theme === 'light' ? 'theme-option-active' : ''}`} onClick={() => onThemeChange('light')} type="button"><Icon name="sun" size={18} /><span><strong>Light</strong><small>Bright workspace</small></span></button><button className={`theme-option ${theme === 'dark' ? 'theme-option-active' : ''}`} onClick={() => onThemeChange('dark')} type="button"><Icon name="moon" size={18} /><span><strong>Dark</strong><small>Low-glare workspace</small></span></button></div></section><section className="panel settings-section"><PanelTitle eyebrow="API connection" title="Service status" meta="Read-only check" /><div className="connection-row"><span className={`connection-indicator connection-${apiStatus}`} /><span><strong>{apiStatus === 'online' ? 'API reachable' : apiStatus === 'offline' ? 'API unavailable' : 'Checking API'}</strong><small>{import.meta.env.VITE_API_URL ?? 'http://localhost:8000'}</small></span><button className="button button-quiet" onClick={onCheck} type="button"><Icon name="refresh" size={14} /> Check</button></div><p className="settings-description">The endpoint is read from <code>VITE_API_URL</code> or the client default. There is no editable remote configuration in this page.</p></section><section className="panel settings-section"><PanelTitle eyebrow="Local behavior" title="Workspace hints" meta={`${enabledEvaluators} evaluators visible`} /><label className="check-row"><input checked={localSettings.showFixtureHints} onChange={(event) => onSettingsChange({ showFixtureHints: event.target.checked })} type="checkbox" /><span><strong>Show data source notices</strong><small>Keep fixture and persisted-data boundaries visible.</small></span></label><label className="check-row"><input checked={localSettings.compactRows} onChange={(event) => onSettingsChange({ compactRows: event.target.checked })} type="checkbox" /><span><strong>Use compact run rows</strong><small>Reduce table row height in Agent runs.</small></span></label></section><section className="panel settings-section danger-section"><PanelTitle eyebrow="Local data" title="Reset browser configuration" /><p className="settings-description">Restore locally created dataset entries, evaluator visibility, and display preferences. This does not delete API projects, runs, or reports.</p><button className="button button-quiet" onClick={onReset} type="button">Reset local configuration</button></section></div><section className="panel account-section"><PanelTitle eyebrow="Authentication" title="Current session" />{session ? <div className="account-row"><span className="user-avatar">{session.user.email.slice(0, 2).toUpperCase()}</span><span><strong>{session.user.email}</strong><small>Authenticated API session</small></span></div> : <div className="account-row"><span className="user-avatar">DE</span><span><strong>No authenticated session</strong><small>Local fixtures remain available offline.</small></span></div>}</section></>
 }
 
-function CliGuide() {
+function LegacyCliGuide() {
   const [language, setLanguage] = useState<'curl' | 'node'>('curl')
   const installCli = `git clone https://github.com/Aryan107rn/VerityBench.git
 cd VerityBench
@@ -982,6 +982,147 @@ veritybench report runs/my-agent-timeout.json`
   const createRun = `curl -s -X POST http://localhost:8000/api/v1/projects/PROJECT_ID/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"agent":"safe","scenario":"timeout_after_success"}'`
   const fetchReport = 'curl -s http://localhost:8000/api/v1/runs/RUN_ID -H "Authorization: Bearer $TOKEN"'
   return <><PageIntro eyebrow="Developer workflow" title="CLI guide" description="Install the real VerityBench command, test an agent locally, and keep source code private. HTTP examples remain available as advanced usage." action={<span className="local-pill"><Icon name="terminal" size={13} /> Local-first</span>} /><div className="local-state-banner cli-privacy-banner"><Icon name="shield" size={16} /><span><strong>Private local mode.</strong> <code>veritybench test</code> runs from your checkout, does not require login, and does not upload agent source. Use <code>sync</code> or the HTTP API only when you explicitly choose remote execution.</span></div><div className="cli-layout"><aside className="panel cli-nav"><span className="section-kicker">Contents</span><a href="#install-cli">01 · Install CLI</a><a href="#test-locally">02 · Test locally</a><a href="#privacy">03 · Privacy boundary</a><a href="#reports-ci">04 · Reports &amp; CI/CD</a><a href="#advanced-api">05 · HTTP API / Advanced</a></aside><div className="cli-content"><section className="cli-section" id="install-cli"><StepHeading number="01" title="Install the CLI" description="Install the packaged veritybench executable from a clean checkout. The command is registered by pyproject.toml." /><p className="cli-copy">Prerequisites: Python 3.12.8, pip, and Git. Docker is only needed when testing your own custom agent through <code>--agent-path</code>.</p><CommandBlock command={installCli} /></section><section className="cli-section" id="test-locally"><StepHeading number="02" title="Test locally" description="Initialize a private workspace, generate the supported agent starter, select a scenario, and save the evidence report." /><CommandBlock command={localSetup} /><div className="cli-substep"><span>Run your agent</span><CommandBlock command={localRun} /></div><div className="cli-substep"><span>Or smoke-test the local engine without Docker</span><CommandBlock command={localSmoke} /></div></section><section className="cli-section" id="privacy"><StepHeading number="03" title="Keep source private" description="Local mode is deliberately separate from API-backed runs." /><div className="cli-facts"><div><strong>Local</strong><span><code>veritybench test</code> reads the agent path from your checkout and writes reports locally.</span></div><div><strong>Sandbox</strong><span>Custom agents run in Docker with no network, read-only files, non-root execution, and bounded resources.</span></div><div><strong>Remote</strong><span><code>sync</code>, GitHub import, and API registration are opt-in workflows; do not use them for private source.</span></div></div></section><section className="cli-section" id="reports-ci"><StepHeading number="04" title="Reports and CI/CD" description="Use readable terminal output for humans and JSON plus exit codes for automation." /><CommandBlock command={ciRun} /><p className="cli-copy">Exit codes: <code>0</code> passed, <code>1</code> independent evaluation found a defect, <code>2</code> invalid input or worker refusal, and <code>124</code> bounded worker timeout. Add <code>NO_COLOR=1</code> for plain terminal output.</p><CommandBlock command="veritybench runs show runs/ci-report.json --json" /></section><section className="cli-section cli-section-advanced" id="advanced-api"><StepHeading number="05" title="HTTP API / Advanced Usage" description="These examples target a running backend and are not required for private local testing." /><div className="cli-advanced-label">Backend health</div><CommandBlock command="curl -s http://localhost:8000/health" /><div className="cli-advanced-label">Authenticate</div><div className="code-tabs"><button className={language === 'curl' ? 'code-tab-active' : ''} onClick={() => setLanguage('curl')} type="button">curl</button><button className={language === 'node' ? 'code-tab-active' : ''} onClick={() => setLanguage('node')} type="button">Node fetch</button></div><CommandBlock command={language === 'curl' ? curlAuth : nodeAuth} /><div className="cli-advanced-label">Create and fetch a persisted run</div><CommandBlock command={`${createRun}\n\n${fetchReport}`} /></section></div></div></>
+}
+
+function CliGuide() {
+  const [language, setLanguage] = useState<'curl' | 'node'>('curl')
+  const installCli = `git clone https://github.com/Aryan107rn/VerityBench.git
+cd VerityBench
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.lock
+python -m pip install .
+veritybench --version`
+  const archSetup = `sudo pacman -Syu
+sudo pacman -S --needed git python python-pip docker docker-compose
+sudo systemctl enable --now docker.service
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker info`
+  const localSetup = `mkdir private-agent-check
+cd private-agent-check
+veritybench init
+veritybench agent init ./my-agent.py
+veritybench validate
+veritybench scenarios list`
+  const localRun = `veritybench test \\
+  --agent-path ./my-agent.py \\
+  --scenario timeout_after_success \\
+  --output runs/my-agent-timeout.json
+veritybench report runs/my-agent-timeout.json`
+  const scenarioRun = `veritybench test \\
+  --agent safe \\
+  --scenario rate_limited \\
+  --param failure_count=2 \\
+  --seed 7`
+  const dockerImage = `docker build --target api -t localhost:5000/veritybench-agent:local .
+docker run -d --restart unless-stopped --name veritybench-registry \\
+  -p 5000:5000 registry:2
+ docker push localhost:5000/veritybench-agent:local
+ export VERITYBENCH_AGENT_IMAGE="$(docker image inspect \\
+  --format '{{index .RepoDigests 0}}' \\
+   localhost:5000/veritybench-agent:local)"`
+  const terminalReport = `veritybench test --agent safe --scenario timeout_after_success
+veritybench report runs/latest.json
+NO_COLOR=1 veritybench report runs/latest.json`
+  const jsonReport = `veritybench test \\
+  --agent-path ./my-agent.py \\
+  --scenario all \\
+  --json \\
+  --output runs/ci-report.json
+veritybench runs show runs/ci-report.json --json`
+  const curlAuth = `curl -s -X POST http://localhost:8000/api/v1/auth/login -H 'Content-Type: application/json' -d '{"email":"you@example.com","password":"your-password"}'`
+  const nodeAuth = [
+    "const response = await fetch(`${API_URL}/api/v1/auth/login`, {",
+    "  method: 'POST',",
+    "  headers: { 'Content-Type': 'application/json' },",
+    "  body: JSON.stringify({ email, password }),",
+    '})',
+    'const { access_token } = await response.json()',
+  ].join('\n')
+  const createRun = `curl -s -X POST http://localhost:8000/api/v1/projects/PROJECT_ID/runs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"agent":"safe","scenario":"timeout_after_success"}'`
+  const fetchReport = 'curl -s http://localhost:8000/api/v1/runs/RUN_ID -H "Authorization: Bearer $TOKEN"'
+
+  return (
+    <>
+      <PageIntro
+        eyebrow="Developer workflow"
+        title="CLI guide"
+        description="Install VerityBench, test a private agent locally, and inspect the branded evidence report. HTTP examples are clearly separated as advanced usage."
+        action={<span className="local-pill"><Icon name="terminal" size={13} /> Local-first</span>}
+      />
+      <div className="local-state-banner cli-privacy-banner">
+        <Icon name="shield" size={16} />
+        <span><strong>Private local mode.</strong> <code>veritybench test</code> runs from your checkout, requires no login, and does not upload agent source. Use <code>sync</code> or the HTTP API only when you explicitly choose remote execution.</span>
+      </div>
+      <div className="cli-layout">
+        <aside className="panel cli-nav">
+          <span className="section-kicker">Contents</span>
+          <a href="#install-cli">01 · Install CLI</a>
+          <a href="#arch-setup">02 · Arch / Omarchy</a>
+          <a href="#test-locally">03 · Test locally</a>
+          <a href="#docker-agent">04 · Private Docker agent</a>
+          <a href="#terminal-reports">05 · Branded reports</a>
+          <a href="#reports-ci">06 · Reports &amp; CI/CD</a>
+          <a href="#advanced-api">07 · HTTP API / Advanced</a>
+        </aside>
+        <div className="cli-content">
+          <section className="cli-section" id="install-cli">
+            <StepHeading number="01" title="Install the CLI" description="Install the packaged veritybench executable from a clean checkout. The command is registered by pyproject.toml." />
+            <p className="cli-copy">Prerequisites: Python 3.12–3.14, pip, and Git. Docker is only needed when testing your own custom agent through <code>--agent-path</code>.</p>
+            <CommandBlock command={installCli} />
+          </section>
+          <section className="cli-section" id="arch-setup">
+            <StepHeading number="02" title="Arch Linux / Omarchy setup" description="Use this once on an Arch-based machine when you want to run a private custom agent inside Docker." />
+            <CommandBlock command={archSetup} />
+            <p className="cli-copy">If you only run the repository-owned sample agents, Docker is not required. If Docker group permissions do not apply immediately, log out and back in, then run <code>docker info</code> again.</p>
+          </section>
+          <section className="cli-section" id="test-locally">
+            <StepHeading number="03" title="Test locally" description="Initialize a private workspace, create the supported agent starter, select scenarios, and save evidence locally." />
+            <CommandBlock command={localSetup} />
+            <div className="cli-substep"><span>Run your private agent</span><CommandBlock command={localRun} /></div>
+            <div className="cli-substep"><span>Configure a deterministic scenario</span><CommandBlock command={scenarioRun} /></div>
+          </section>
+          <section className="cli-section" id="docker-agent">
+            <StepHeading number="04" title="Run a private agent in Docker" description="Build a compatible local image, pin it by digest, and then execute the agent without sending source to VerityBench." />
+            <CommandBlock command={dockerImage} />
+            <div className="cli-substep"><span>Execute the pinned image</span><CommandBlock command={`veritybench test \\
+  --agent-path ./my-agent.py \\
+  --scenario timeout_after_success \\
+  --timeout 20 \\
+  --output runs/docker-timeout.json`} /></div>
+            <p className="cli-copy">The sandbox uses no network, a read-only filesystem, non-root execution, dropped capabilities, and bounded CPU, memory, process count, and output. The API is not involved.</p>
+          </section>
+          <section className="cli-section" id="terminal-reports">
+            <StepHeading number="05" title="See the branded terminal report" description="Human output uses the VerityBench logo, verdict, metrics, independent checks, evidence, findings, and recommendations." />
+            <CommandBlock command={terminalReport} />
+            <p className="cli-copy">The logo and styled report are the default terminal experience. Use <code>NO_COLOR=1</code> for plain text while keeping the report content. Use <code>--json</code> only for automation; JSON intentionally contains no terminal branding.</p>
+          </section>
+          <section className="cli-section" id="reports-ci">
+            <StepHeading number="06" title="Reports and CI/CD" description="Use readable output for humans and JSON plus exit codes for automation." />
+            <CommandBlock command={jsonReport} />
+            <div className="cli-facts">
+              <div><strong>0</strong><span>Evaluation passed.</span></div>
+              <div><strong>1</strong><span>Independent evaluation found a defect.</span></div>
+              <div><strong>2</strong><span>Invalid input, contract failure, or worker refusal.</span></div>
+              <div><strong>124</strong><span>Bounded custom-agent execution timed out.</span></div>
+            </div>
+          </section>
+          <section className="cli-section cli-section-advanced" id="advanced-api">
+            <StepHeading number="07" title="HTTP API / Advanced Usage" description="These examples target a running backend and are not required for private local testing." />
+            <div className="cli-advanced-label">Backend health</div>
+            <CommandBlock command="curl -s http://localhost:8000/health" />
+            <div className="cli-advanced-label">Authenticate</div>
+            <div className="code-tabs"><button className={language === 'curl' ? 'code-tab-active' : ''} onClick={() => setLanguage('curl')} type="button">curl</button><button className={language === 'node' ? 'code-tab-active' : ''} onClick={() => setLanguage('node')} type="button">Node fetch</button></div>
+            <CommandBlock command={language === 'curl' ? curlAuth : nodeAuth} />
+            <div className="cli-advanced-label">Create and fetch a persisted run</div>
+            <CommandBlock command={`${createRun}\n\n${fetchReport}`} />
+          </section>
+        </div>
+      </div>
+    </>
+  )
 }
 
 function StepHeading({ description, number, title }: { description: string; number: string; title: string }) {

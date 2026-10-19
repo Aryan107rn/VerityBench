@@ -94,6 +94,20 @@ does not require login, and does not upload agent source. `sync`, API agent
 registration, and GitHub import are separate remote workflows and must not be
 used when source must remain local.
 
+On Arch Linux or Omarchy, install the local prerequisites with:
+
+```bash
+sudo pacman -Syu
+sudo pacman -S --needed git python python-pip docker docker-compose
+sudo systemctl enable --now docker.service
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker info
+```
+
+Docker is only needed for a custom `--agent-path` run. The repository-owned
+sample agents run through the deterministic engine without Docker.
+
 ### Initialize and validate
 
 ```bash
@@ -173,6 +187,19 @@ matching the saved JSON report, without branding, live events, or ANSI styling.
 Set `NO_COLOR=1` to disable terminal colors. Report layouts automatically adapt
 to the available terminal width; redirected output remains readable without
 ANSI escape controls.
+
+The default terminal report is branded with the VerityBench logo and includes
+the verdict, metrics, independent checks, evidence, findings, and
+recommendations:
+
+```bash
+veritybench test --agent safe --scenario timeout_after_success
+veritybench report runs/latest.json
+NO_COLOR=1 veritybench report runs/latest.json
+```
+
+Use `--json` only when a machine-readable report is required; JSON mode
+intentionally omits terminal branding.
 
 For CI/CD, save the machine-readable report and preserve the process exit code:
 
